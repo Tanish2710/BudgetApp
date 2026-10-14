@@ -66,14 +66,21 @@ def compute_balances(group_id=None):
     return {uid: round(bal, 2) for uid, bal in balances.items()}
 
 def compute_balances_detailed(group_id=None):
-    """Returns list of {user_id, name, balance, status} sorted descending."""
+    """Returns list of {user_id, name, balance, status} sorted descending — single batched user lookup."""
     balances = compute_balances(group_id)
     if not balances:
         return []
     conn = get_db_connection()
+    try:
+        uids = list(balances.keys())
+        placeholders = ",".join(["?"] * len(uids))
+        rows = conn.execute(f"SELECT user_id, name, email FROM users WHERE user_id IN ({placeholders})", uids).fetchall()
+        user_lookup = {r["user_id"]: dict(r) for r in rows}
+    finally:
+        conn.close()
     result = []
     for uid, bal in balances.items():
-        row = conn.execute("SELECT name, email FROM users WHERE user_id = ?", (uid,)).fetchone()
+        row = user_lookup.get(uid)
         name = row["name"] if row else f"User {uid}"
         email = row["email"] if row else ""
         status = "gets back" if bal > 0.01 else ("owes" if bal < -0.01 else "settled")
@@ -84,7 +91,6 @@ def compute_balances_detailed(group_id=None):
             "balance": round(bal, 2),
             "status": status
         })
-    conn.close()
     result.sort(key=lambda x: x["balance"], reverse=True)
     return result
 
@@ -121,16 +127,23 @@ def simplify_debts(balances):
     return transactions
 
 def get_who_owes_whom(group_id=None):
-    """Returns list of dicts {from_user, from_name, to_user, to_name, amount}."""
+    """Returns list of dicts {from_user, from_name, to_user, to_name, amount} — batched user lookup."""
     balances = compute_balances(group_id)
     txns = simplify_debts(balances)
     if not txns:
         return []
+    involved = list({uid for txn in txns for uid in txn[:2]})
     conn = get_db_connection()
+    try:
+        placeholders = ",".join(["?"] * len(involved))
+        rows = conn.execute(f"SELECT user_id, name, email FROM users WHERE user_id IN ({placeholders})", involved).fetchall()
+        ulookup = {r["user_id"]: dict(r) for r in rows}
+    finally:
+        conn.close()
     result = []
     for from_id, to_id, amt in txns:
-        f_row = conn.execute("SELECT name, email FROM users WHERE user_id = ?", (from_id,)).fetchone()
-        t_row = conn.execute("SELECT name, email FROM users WHERE user_id = ?", (to_id,)).fetchone()
+        f_row = ulookup.get(from_id)
+        t_row = ulookup.get(to_id)
         result.append({
             "from_user": from_id,
             "from_name": f_row["name"] if f_row else f"User {from_id}",
@@ -140,7 +153,6 @@ def get_who_owes_whom(group_id=None):
             "to_email": t_row["email"] if t_row else "",
             "amount": amt
         })
-    conn.close()
     return result
 
 def get_unpaid_splits(group_id=None):

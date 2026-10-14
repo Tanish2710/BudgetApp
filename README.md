@@ -1,6 +1,6 @@
 # Smart Budgeter ✦ Debt-Splitter Pro
 
-An executive personal finance command center and Splitwise-style group debt-splitting ecosystem. Log personal expenses and incomes, establish category-level budgets with live pacing analysis, split group bills across 4 flexible modes, simplify multi-party debts with greedy algorithms, settle up with 1-click flows, and automate gentle reminders across WhatsApp, Email, and Discord.
+An executive personal finance command center and Splitwise-style group debt-splitting ecosystem. Log personal expenses and incomes, establish category-level budgets with live pacing analysis, split group bills across 4 flexible modes, simplify multi-party debts with greedy algorithms, settle up with 1-click flows, and dispatch automated payment reminder statements via Email.
 
 ---
 
@@ -31,11 +31,13 @@ An executive personal finance command center and Splitwise-style group debt-spli
 - **⚡ 1-Click "Settle Up"**: Click "Settle Up" on any debt card to instantly pre-fill payer, receiver, amount, and notes in the settlement form.
 - **Payment Method Tracking**: Record repayments via Cash, Venmo, UPI, Bank Transfer, Zelle, or PayPal.
 
-### 5. Multi-Channel Reminders & Automation
-- **Overdue Detection**: Configurable threshold (e.g. > 3 days) to pinpoint delinquent splits.
-- **1-Click WhatsApp Links**: Generates pre-filled click-to-chat links for instant mobile/desktop WhatsApp messaging.
-- **In-App & CLI Email / Discord Trigger**: Dispatch gentle reminders directly from the Streamlit UI or run unattended via cron/systemd.
-- **Dry-Run Safe**: Default simulation mode prevents accidental message dispatch during development and testing.
+### 5. Automated Email Reminders & Statements Engine
+- **Dedicated Email Delivery**: Send formal payment statements and gentle payment reminders via email (SMTP) to delinquent debtors.
+- **HTML & Plain-Text Statement Templates**: Responsive, professional financial statements featuring item details, original payer, debt share, and settlement instructions.
+- **In-App Preview & 1-Click Send**: Preview the rendered HTML email statement before sending, with 1-click dispatch per split or bulk dispatch across all overdue debts.
+- **Dry-Run Safe Mode**: Default simulation mode verifies recipient emails, templates, and triggers without sending live messages.
+- **Interactive SMTP Config & Connection Test**: Enter and test SMTP credentials (e.g. Gmail App Passwords) directly in the UI.
+- **Headless CLI & Cron Automation**: Standalone `reminders.py --live` for scheduled daily reminder dispatching.
 
 ---
 
@@ -101,5 +103,4 @@ python reminders.py --live --overdue-days 3
 ## 💼 Resume & Portfolio Highlights
 - **Engineered Full Financial Architecture**: Designed normalized SQLite schema with 9 tables, foreign key constraints, composite keys, and indexing.
 - **Greedy Optimization Algorithm**: Implemented minimal cash-flow debt simplification reducing $O(N^2)$ circular debts to minimal direct transfers.
-- **Interactive Fintech Analytics**: Built Streamlit dashboard featuring Plotly Sankey diagrams, donut category breakdowns, cash flow pacing, and category budget gauges.
-- **Multi-Channel Notification Engine**: Created automated notification pipelines across smtplib (TLS email), Discord Webhook APIs, and dynamic WhatsApp URL schemes.
+- **Automated Email Reminders & Statements Engine**: Created an automated email notification pipeline using Python's `smtplib` and `email` packages to render and dispatch professional multipart (HTML + plain text) financial statements with live and dry-run modes.

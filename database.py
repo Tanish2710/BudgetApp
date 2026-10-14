@@ -112,9 +112,16 @@ CREATE TABLE IF NOT EXISTS settlements (
 );
 
 CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date);
+CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
 CREATE INDEX IF NOT EXISTS idx_incomes_user_date ON incomes(user_id, date);
 CREATE INDEX IF NOT EXISTS idx_shared_group ON shared_expenses(group_id);
+CREATE INDEX IF NOT EXISTS idx_shared_payer ON shared_expenses(payer_id);
 CREATE INDEX IF NOT EXISTS idx_splits_user ON splits(user_id);
+CREATE INDEX IF NOT EXISTS idx_splits_shared ON splits(shared_id);
+CREATE INDEX IF NOT EXISTS idx_splits_paid ON splits(is_paid);
+CREATE INDEX IF NOT EXISTS idx_settlements_group ON settlements(group_id);
+CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id);
 """
 
 def run_migrations(conn):
@@ -233,7 +240,7 @@ def update_user(user_id, name=None, email=None, phone=None, monthly_budget=None)
             raise ValueError(f"Email '{clean_email}' is already registered to user '{existing_e['name']}'.")
 
     if phone is not None and clean_phone:
-        existing_p = cur.execute("SELECT user_id, name FROM users WHERE phone = ?", (clean_phone, user_id)).fetchone()
+        existing_p = cur.execute("SELECT user_id, name FROM users WHERE phone = ? AND user_id != ?", (clean_phone, user_id)).fetchone()
         if existing_p:
             conn.close()
             raise ValueError(f"Mobile number '{clean_phone}' is already registered to user '{existing_p['name']}'.")
@@ -449,6 +456,16 @@ def delete_category_budget(user_id, category):
     conn.execute("DELETE FROM category_budgets WHERE user_id = ? AND category = ?", (user_id, category))
     conn.commit()
     conn.close()
+
+def get_distinct_categories(user_id=None):
+    """Return sorted distinct categories without loading all expense rows (perf)."""
+    conn = get_db_connection()
+    if user_id:
+        rows = conn.execute("SELECT DISTINCT category FROM expenses WHERE user_id = ? AND category IS NOT NULL AND TRIM(category) != '' ORDER BY category", (user_id,)).fetchall()
+    else:
+        rows = conn.execute("SELECT DISTINCT category FROM expenses WHERE category IS NOT NULL AND TRIM(category) != '' ORDER BY category").fetchall()
+    conn.close()
+    return [r["category"] for r in rows if r["category"]]
 
 # --- Groups CRUD ---
 def create_group(group_name):
