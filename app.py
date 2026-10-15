@@ -73,24 +73,47 @@ TOKENS = {
 }
 
 
-def _theme_sync_script(dark, profile_id=None):
-    """Point Streamlit's theme at the chosen mode, and reload once if it was showing the other one."""
+def _theme_sync_script(dark, switching, profile_id=None, run=0):
+    """Keep Streamlit's painted theme, its stored preference and our cookie in step.
+
+    After the sidebar switch (or on a first visit) the switch wins. Otherwise whatever the
+    page is painted in wins, so a change made from Streamlit's own settings menu sticks.
+    Either way the page reloads once when Python's idea of the mode was wrong.
+    """
     want = "Dark" if dark else "Light"
     profile = f"document.cookie = '{PROFILE_COOKIE}={int(profile_id)}; path=/; max-age=60; SameSite=Lax';" if profile_id else ""
     return f"""<script>
+/* run {run} */
 (() => {{
   const want = "{want}";
   const key = "stActiveTheme-" + window.location.pathname + "-v2";
-  document.cookie = "{THEME_COOKIE}={want.lower()}; path=/; max-age=31536000; SameSite=Lax";
+  const setCookie = (mode) => {{
+    document.cookie = "{THEME_COOKIE}=" + mode.toLowerCase() + "; path=/; max-age=31536000; SameSite=Lax";
+  }};
+  const reload = () => {{ {profile} window.location.reload(); }};
+  const paintedMode = () => {{
+    const app = document.querySelector(".stApp");
+    const rgb = app ? getComputedStyle(app).backgroundColor.match(/\\d+/g) : null;
+    return rgb ? ((0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) < 128 ? "Dark" : "Light") : null;
+  }};
+  const painted = paintedMode();
   let stored = null;
   try {{ stored = JSON.parse(window.localStorage.getItem(key)); }} catch (e) {{}}
-  if (stored === want) return;
-  window.localStorage.setItem(key, JSON.stringify(want));
-  // Only reload when the page is actually painted in the other mode.
-  const app = document.querySelector(".stApp");
-  const rgb = app ? getComputedStyle(app).backgroundColor.match(/\\d+/g) : null;
-  const showingDark = rgb ? (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) < 128 : null;
-  if (showingDark !== (want === "Dark")) {{ {profile} window.location.reload(); }}
+  // Streamlit stores "System" until someone picks Light or Dark; treat that as no choice yet.
+  if ({'true' if switching else 'false'} || (stored !== "Light" && stored !== "Dark")) {{
+    setCookie(want);
+    window.localStorage.setItem(key, JSON.stringify(want));
+    if (painted && painted !== want) return reload();
+  }} else if (painted && painted !== want) {{
+    setCookie(painted);
+    return reload();
+  }}
+  // The light/dark buttons in Streamlit's own menu repaint without a rerun; follow them.
+  clearInterval(window.__sbThemeWatch);
+  window.__sbThemeWatch = setInterval(() => {{
+    const now = paintedMode();
+    if (now && now !== want) {{ clearInterval(window.__sbThemeWatch); setCookie(now); reload(); }}
+  }}, 700);
 }})();
 </script>"""
 
@@ -101,10 +124,11 @@ def _on_theme_toggle():
 
 def theme_toggle(profile_id=None):
     """Sidebar switch between light and dark mode."""
+    st.session_state["_theme_runs"] = st.session_state.get("_theme_runs", 0) + 1
     with st.sidebar:
         st.toggle("Dark mode", key="dark_mode", on_change=_on_theme_toggle)
-        st.html(_theme_sync_script(st.session_state["dark_mode"],
-                                   profile_id if st.session_state.pop("_theme_switch", False) else None),
+        st.html(_theme_sync_script(st.session_state["dark_mode"], st.session_state.pop("_theme_switch", False),
+                                   profile_id, st.session_state["_theme_runs"]),
                 unsafe_allow_javascript=True)
 
 
@@ -117,7 +141,7 @@ st.markdown(f"<style>:root {{ {_root_vars}; color-scheme: {'dark' if DARK else '
 st.markdown("""
 <style>
   .block-container { max-width: 1240px; padding-top: 2.4rem; padding-bottom: 4rem; }
-  footer, [data-testid="stAppDeployButton"] { display: none !important; }
+  footer { display: none !important; }
   h1, h2, h3, h4 { letter-spacing: -0.015em; }
 
   /* Bordered containers read as white cards on the off-white page */

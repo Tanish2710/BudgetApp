@@ -39,7 +39,7 @@ backgroundColor = "#191b26"
 secondaryBackgroundColor = "#252838"
 
 [client]
-toolbarMode = "minimal"
+toolbarMode = "auto"
 showErrorDetails = true
 
 [browser]
