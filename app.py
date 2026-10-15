@@ -47,9 +47,9 @@ CURRENCIES = ["₹", "$", "€", "£", "¥"]
 st.markdown("""
 <style>
   :root {
-    --ink: #1a1a19; --ink-2: #52514e; --muted: #898781;
-    --line: #e3e2dc; --surface: #ffffff; --plane: #f7f7f5; --track: #efeee9;
-    --accent: #2a78d6; --pos: #006300; --neg: #b42318; --warn: #a15c00;
+    --ink: #2b2d42; --ink-2: #565a6e; --muted: #80849a;
+    --line: #e2e4ee; --surface: #fcfcfe; --plane: #f5f6fa; --track: #eceef5;
+    --accent: #5274c4; --pos: #2f7d5b; --neg: #bb4a48; --warn: #93661a;
   }
   .block-container { max-width: 1240px; padding-top: 2.4rem; padding-bottom: 4rem; }
   footer, [data-testid="stAppDeployButton"] { display: none !important; }
@@ -87,10 +87,10 @@ st.markdown("""
 
   .chip { display: inline-block; font-size: .72rem; font-weight: 600; padding: 2px 8px; border-radius: 999px;
           border: 1px solid var(--line); color: var(--ink-2); background: var(--plane); white-space: nowrap; }
-  .chip-pos { color: var(--pos); background: #eef7ee; border-color: #cfe6cf; }
-  .chip-neg { color: var(--neg); background: #fdf1ef; border-color: #f4d3cd; }
-  .chip-warn { color: var(--warn); background: #fdf6e7; border-color: #f1dfb5; }
-  .chip-blue { color: #1c5cab; background: #eef4fc; border-color: #cfe0f6; }
+  .chip-pos { color: var(--pos); background: #eef8f2; border-color: #cfe8da; }
+  .chip-neg { color: var(--neg); background: #fdf2f1; border-color: #f4d6d3; }
+  .chip-warn { color: var(--warn); background: #fdf7ea; border-color: #f0e0b8; }
+  .chip-blue { color: #3f63b0; background: #eef2fb; border-color: #d6e0f5; }
 
   .empty { text-align: center; padding: 36px 16px; color: var(--ink-2); }
   .empty b { display: block; color: var(--ink); font-size: 1rem; margin-bottom: 4px; }

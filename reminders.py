@@ -154,7 +154,7 @@ def build_statement_plain(statement, curr="₹", sender_name=APP_NAME):
 def build_statement_html(statement, curr="₹", sender_name=APP_NAME):
     """Email-safe HTML (table layout, inline styles, all user content escaped)."""
     e = html.escape
-    ink, muted, line, accent = "#0b0b0b", "#6b6a66", "#e6e5e0", "#2a78d6"
+    ink, muted, line, accent = "#2b2d42", "#666a7e", "#e2e4ee", "#5274c4"
     font = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
 
     circle_blocks = []
@@ -185,7 +185,7 @@ def build_statement_html(statement, curr="₹", sender_name=APP_NAME):
             for t in c["transfers"]
         )
         settle_html = (f"""
-            <div style="margin-top:12px;padding:12px 14px;background:#f5f8fd;border-radius:6px;font-size:13px;color:{ink};">
+            <div style="margin-top:12px;padding:12px 14px;background:#f1f4fb;border-radius:6px;font-size:13px;color:{ink};">
               <div style="font-weight:600;margin-bottom:4px;">How to settle</div>
               <ul style="margin:0;padding-left:18px;">{transfers}</ul>
             </div>""" if transfers else "")
@@ -201,8 +201,8 @@ def build_statement_html(statement, curr="₹", sender_name=APP_NAME):
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Payment reminder</title></head>
-<body style="margin:0;padding:0;background:#f4f4f1;font-family:{font};">
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f4f1;padding:24px 12px;">
+<body style="margin:0;padding:0;background:#f5f6fa;font-family:{font};">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f5f6fa;padding:24px 12px;">
     <tr><td align="center">
       <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#ffffff;border:1px solid {line};border-radius:10px;">
         <tr><td style="padding:24px 32px 0 32px;">
@@ -229,7 +229,7 @@ def build_statement_html(statement, curr="₹", sender_name=APP_NAME):
           <br><br>Thanks,<br>{e(sender_name)}
         </td></tr>
       </table>
-      <div style="font-size:11px;color:#9a9993;margin-top:14px;">Sent by {e(APP_NAME)} on behalf of your circle.</div>
+      <div style="font-size:11px;color:#8a8ea0;margin-top:14px;">Sent by {e(APP_NAME)} on behalf of your circle.</div>
     </td></tr>
   </table>
 </body>
