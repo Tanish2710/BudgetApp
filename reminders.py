@@ -1,408 +1,490 @@
 """
-reminders.py - Dedicated Email Reminder & Automation Engine for Outstanding Debts
-- Generates professional HTML & Plain-text settlement statement emails
-- Provides single-split instant reminder dispatch & batch automation
-- Supports live SMTP delivery (Gmail, Outlook, custom SMTP) and safe Dry-Run preview
-- Standalone CLI execution via cron or one-click execution from Streamlit UI
+reminders.py - Payment reminder engine
+
+- Builds one consolidated statement per person who owes money (per circle breakdown,
+  consistent with recorded settlements and items marked paid)
+- Sends multipart HTML + plain-text email over SMTP (STARTTLS or SSL), or simulates it
+- Automatic reminders: a daily schedule, an overdue threshold, a per-person cooldown
+  and a minimum amount, all stored in the app database and shared by the Streamlit app
+  and the CLI, so running both never double-sends
+- Every attempt is written to the reminder_log table
+
+CLI:
+    python reminders.py --summary          # who owes what and who is due a reminder
+    python reminders.py --run-now          # send due reminders now (dry-run unless live mode is on)
+    python reminders.py --auto             # cron entry point: only runs if today's scheduled run is due
 """
-import smtplib
+import html
 import os
-import json
-from email.mime.text import MIMEText
+import smtplib
+import threading
+import time
+from datetime import datetime, date, timedelta
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.utils import formataddr, make_msgid, formatdate
+
 import database as db
 import logic
 
-# Global fallback defaults from environment variables
-DEFAULT_SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-DEFAULT_SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-DEFAULT_SMTP_USER = os.getenv("SMTP_USER", "")
-DEFAULT_SMTP_PASS = os.getenv("SMTP_PASS", "")
-DEFAULT_FROM_EMAIL = os.getenv("FROM_EMAIL", DEFAULT_SMTP_USER or "reminders@smartbudgeter.local")
-DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
-OVERDUE_DAYS = int(os.getenv("OVERDUE_DAYS", "3"))
+APP_NAME = "Smart Budgeter"
 
+DEFAULT_SETTINGS = {
+    "currency": "₹",
+    # Automatic reminders
+    "auto_enabled": False,
+    "live_mode": False,          # False = dry-run: emails are rendered and logged, never sent
+    "overdue_days": 3,           # only remind once the oldest open item is this old
+    "cadence_days": 3,           # minimum days between reminders to the same person
+    "min_amount": 1.0,           # ignore balances below this
+    "send_hour": 9,              # local hour for the daily run
+    "last_auto_run_date": None,  # ISO date of the last claimed automatic run
+    # SMTP (environment variables are used for anything left blank)
+    "smtp_host": "",
+    "smtp_port": 0,
+    "smtp_user": "",
+    "smtp_pass": "",
+    "from_email": "",
+    "sender_name": APP_NAME,
+}
+
+SMTP_KEYS = ["smtp_host", "smtp_port", "smtp_user", "smtp_pass", "from_email", "sender_name"]
+
+
+# ---------------------------------------------------------------------------
+# Settings & credentials
+# ---------------------------------------------------------------------------
+def get_settings():
+    db.init_db()
+    return db.get_settings(DEFAULT_SETTINGS)
+
+
+def save_settings(values):
+    unknown = set(values) - set(DEFAULT_SETTINGS)
+    if unknown:
+        raise KeyError(f"Unknown reminder settings: {sorted(unknown)}")
+    db.set_settings(values)
+
+
+def get_smtp_credentials(settings=None):
+    """Resolve SMTP settings: saved settings first, then environment variables."""
+    s = settings if settings is not None else get_settings()
+    host = s.get("smtp_host") or os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port = int(s.get("smtp_port") or os.getenv("SMTP_PORT", "587"))
+    user = s.get("smtp_user") or os.getenv("SMTP_USER", "")
+    passwd = s.get("smtp_pass") or os.getenv("SMTP_PASS", "")
+    from_email = s.get("from_email") or os.getenv("FROM_EMAIL", "") or user
+    sender_name = s.get("sender_name") or APP_NAME
+    return {"host": host, "port": port, "user": user, "pass": passwd,
+            "from_email": from_email, "sender_name": sender_name}
+
+
+def smtp_is_configured(settings=None):
+    c = get_smtp_credentials(settings)
+    return bool(c["user"] and c["pass"] and c["from_email"])
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
 def fmt_money(a, curr="₹"):
     try:
-        return f"{curr}{float(a):,.2f}"
+        v = float(a)
     except (ValueError, TypeError):
-        return f"{curr}0.00"
+        v = 0.0
+    sign = "-" if v < 0 else ""
+    return f"{sign}{curr}{abs(v):,.2f}"
 
-def get_smtp_credentials(smtp_config=None):
-    """Resolves SMTP settings prioritizing custom config over environment variables."""
-    cfg = smtp_config or {}
-    host = cfg.get("host") or DEFAULT_SMTP_HOST
-    port = int(cfg.get("port") or DEFAULT_SMTP_PORT)
-    user = cfg.get("user") or DEFAULT_SMTP_USER
-    passwd = cfg.get("pass") or DEFAULT_SMTP_PASS
-    from_email = cfg.get("from_email") or DEFAULT_FROM_EMAIL or user or "reminders@smartbudgeter.local"
-    return host, port, user, passwd, from_email
 
-def build_email_plain(debtor_name, payer_name, description, amount_owed, date, total, group_name="", curr="₹"):
-    group_str = f" ({group_name})" if group_name else ""
-    return (
-        f"Hi {debtor_name},\n\n"
-        f"This is a friendly reminder regarding your pending share for a shared expense{group_str}:\n\n"
-        f"  • Expense: {description}\n"
-        f"  • Date: {date}\n"
-        f"  • Bill Total: {fmt_money(total, curr)} (Paid by {payer_name})\n"
-        f"  • Your Share Owed: {fmt_money(amount_owed, curr)}\n\n"
-        f"Whenever convenient, please settle up with {payer_name} via your preferred payment method "
-        f"(UPI, Cash, Bank Transfer, or Venmo). Once settled, this balance will be updated in the Smart Budgeter app.\n\n"
-        f"Warm regards,\n"
-        f"Smart Budgeter & Debt-Splitter Automated Reminders\n"
-    )
+def _fmt_date(iso):
+    try:
+        return date.fromisoformat(str(iso)[:10]).strftime("%d %b %Y")
+    except ValueError:
+        return str(iso)
 
-def build_email_html(debtor_name, payer_name, description, amount_owed, date, total, group_name="", curr="₹"):
-    group_badge = f'<span style="background:#EEF2FF; color:#4F46E5; font-size:12px; font-weight:600; padding:4px 10px; border-radius:12px; margin-left:8px;">{group_name}</span>' if group_name else ""
-    formatted_amount = fmt_money(amount_owed, curr)
-    formatted_total = fmt_money(total, curr)
 
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Payment Reminder</title>
-      <style>
-        body {{
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-          background-color: #F8FAFC;
-          color: #1E293B;
-          margin: 0;
-          padding: 24px 12px;
-        }}
-        .email-container {{
-          max-width: 560px;
-          margin: 0 auto;
-          background: #FFFFFF;
-          border-radius: 14px;
-          border: 1px solid #E2E8F0;
-          overflow: hidden;
-          box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
-        }}
-        .email-header {{
-          background: #1E293B;
-          border-bottom: 2px solid #2563EB;
-          padding: 24px 28px;
-          color: #FFFFFF;
-        }}
-        .email-header h1 {{
-          margin: 0;
-          font-size: 19px;
-          font-weight: 700;
-          letter-spacing: -0.01em;
-          color: #FFFFFF;
-        }}
-        .email-header p {{
-          margin: 4px 0 0 0;
-          font-size: 12px;
-          color: #94A3B8;
-        }}
-        .email-body {{
-          padding: 26px 28px;
-        }}
-        .salutation {{
-          font-size: 15px;
-          font-weight: 600;
-          color: #0F172A;
-          margin-bottom: 10px;
-        }}
-        .amount-box {{
-          background: #F8FAFC;
-          border: 1px solid #E2E8F0;
-          border-radius: 8px;
-          padding: 18px;
-          text-align: center;
-          margin: 18px 0;
-        }}
-        .amount-label {{
-          font-size: 11px;
-          text-transform: uppercase;
-          letter-spacing: 0.06em;
-          color: #64748B;
-          font-weight: 700;
-          margin-bottom: 4px;
-        }}
-        .amount-value {{
-          font-size: 30px;
-          font-weight: 800;
-          color: #0F172A;
-          font-family: 'JetBrains Mono', Consolas, monospace;
-          letter-spacing: -0.02em;
-        }}
-        .details-table {{
-          width: 100%;
-          border-collapse: collapse;
-          margin: 16px 0;
-          font-size: 13px;
-        }}
-        .details-table td {{
-          padding: 9px 0;
-          border-bottom: 1px solid #F1F5F9;
-        }}
-        .details-table td.label {{
-          color: #64748B;
-          font-weight: 500;
-          width: 35%;
-        }}
-        .details-table td.value {{
-          color: #0F172A;
-          font-weight: 600;
-          text-align: right;
-        }}
-        .instruction-box {{
-          background: #F8FAFC;
-          border: 1px solid #CBD5E1;
-          border-radius: 6px;
-          padding: 12px 14px;
-          font-size: 13px;
-          color: #334155;
-          margin-top: 16px;
-          line-height: 1.45;
-        }}
-        .email-footer {{
-          padding: 20px 28px;
-          background: #F8FAFC;
-          border-top: 1px solid #E2E8F0;
-          text-align: center;
-          font-size: 12px;
-          color: #94A3B8;
-        }}
-      </style>
-    </head>
-    <body>
-      <div class="email-container">
-        <div class="email-header">
-          <h1>Expense Settlement Statement{group_badge}</h1>
-          <p>Smart Budgeter &bull; Accounts Receivable</p>
-        </div>
-        <div class="email-body">
-          <div class="salutation">Hi {debtor_name},</div>
-          <p style="font-size: 14px; line-height: 1.5; color: #475569; margin: 0 0 16px 0;">
-            This is a friendly statement regarding an outstanding shared expense split.
-          </p>
-          
-          <div class="amount-box">
-            <div class="amount-label">Your Share Outstanding</div>
-            <div class="amount-value">{formatted_amount}</div>
+def _days_phrase(n):
+    if n <= 0:
+        return "today"
+    return "1 day" if n == 1 else f"{n} days"
+
+
+# ---------------------------------------------------------------------------
+# Email content
+# ---------------------------------------------------------------------------
+def build_subject(statement, curr="₹"):
+    circles = statement["circles"]
+    where = circles[0]["group_name"] if len(circles) == 1 else f"{len(circles)} circles"
+    return f"Payment reminder: {fmt_money(statement['total_owed'], curr)} outstanding ({where})"
+
+
+def build_statement_plain(statement, curr="₹", sender_name=APP_NAME):
+    lines = [
+        f"Hi {statement['name']},",
+        "",
+        f"This is a reminder that you have an outstanding balance of "
+        f"{fmt_money(statement['total_owed'], curr)} on {APP_NAME}.",
+        f"The oldest open item dates from {_fmt_date(statement['oldest_due'])} "
+        f"({_days_phrase(statement['days_outstanding'])} ago).",
+        "",
+    ]
+    for c in statement["circles"]:
+        lines.append(f"{c['group_name']}")
+        lines.append("-" * len(c["group_name"]))
+        for it in c["items"]:
+            lines.append(f"  {_fmt_date(it['date'])}  {it['description']} (paid by {it['payer_name']})"
+                         f"  {fmt_money(it['amount_owed'], curr)}")
+        if c["credits"] > 0.004:
+            lines.append(f"  Payments and credits  -{fmt_money(c['credits'], curr)}")
+        lines.append(f"  Balance due  {fmt_money(c['owed'], curr)}")
+        if c["transfers"]:
+            lines.append("  To settle:")
+            for t in c["transfers"]:
+                lines.append(f"    Pay {t['to_name']} {fmt_money(t['amount'], curr)}")
+        lines.append("")
+    lines += [
+        "Once you've paid, ask the person you paid to record it in the app and this reminder will stop.",
+        "",
+        "Thanks,",
+        sender_name,
+    ]
+    return "\n".join(lines)
+
+
+def build_statement_html(statement, curr="₹", sender_name=APP_NAME):
+    """Email-safe HTML (table layout, inline styles, all user content escaped)."""
+    e = html.escape
+    ink, muted, line, accent = "#0b0b0b", "#6b6a66", "#e6e5e0", "#2a78d6"
+    font = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+
+    circle_blocks = []
+    for c in statement["circles"]:
+        rows = []
+        for it in c["items"]:
+            rows.append(f"""
+              <tr>
+                <td style="padding:10px 0;border-bottom:1px solid {line};font-size:14px;color:{ink};">
+                  {e(str(it['description']))}
+                  <div style="font-size:12px;color:{muted};margin-top:2px;">{e(_fmt_date(it['date']))} &middot; paid by {e(str(it['payer_name']))}</div>
+                </td>
+                <td align="right" style="padding:10px 0;border-bottom:1px solid {line};font-size:14px;color:{ink};white-space:nowrap;">{e(fmt_money(it['amount_owed'], curr))}</td>
+              </tr>""")
+        if c["credits"] > 0.004:
+            rows.append(f"""
+              <tr>
+                <td style="padding:10px 0;border-bottom:1px solid {line};font-size:14px;color:{muted};">Payments and credits</td>
+                <td align="right" style="padding:10px 0;border-bottom:1px solid {line};font-size:14px;color:{muted};white-space:nowrap;">&minus;{e(fmt_money(c['credits'], curr))}</td>
+              </tr>""")
+        rows.append(f"""
+              <tr>
+                <td style="padding:12px 0 4px 0;font-size:14px;font-weight:600;color:{ink};">Balance due</td>
+                <td align="right" style="padding:12px 0 4px 0;font-size:14px;font-weight:600;color:{ink};white-space:nowrap;">{e(fmt_money(c['owed'], curr))}</td>
+              </tr>""")
+        transfers = "".join(
+            f"<li style='margin:2px 0;'>Pay <strong>{e(t['to_name'])}</strong> {e(fmt_money(t['amount'], curr))}</li>"
+            for t in c["transfers"]
+        )
+        settle_html = (f"""
+            <div style="margin-top:12px;padding:12px 14px;background:#f5f8fd;border-radius:6px;font-size:13px;color:{ink};">
+              <div style="font-weight:600;margin-bottom:4px;">How to settle</div>
+              <ul style="margin:0;padding-left:18px;">{transfers}</ul>
+            </div>""" if transfers else "")
+        circle_blocks.append(f"""
+          <tr><td style="padding:20px 32px 4px 32px;">
+            <div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:{muted};">{e(c['group_name'])}</div>
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-top:6px;">
+              {''.join(rows)}
+            </table>
+            {settle_html}
+          </td></tr>""")
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Payment reminder</title></head>
+<body style="margin:0;padding:0;background:#f4f4f1;font-family:{font};">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f4f1;padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#ffffff;border:1px solid {line};border-radius:10px;">
+        <tr><td style="padding:24px 32px 0 32px;">
+          <div style="font-size:14px;font-weight:700;color:{ink};">
+            <span style="display:inline-block;width:10px;height:10px;background:{accent};border-radius:2px;margin-right:8px;vertical-align:middle;"></span>{e(APP_NAME)}
           </div>
-
-          <table class="details-table">
-            <tr>
-              <td class="label">Expense Item</td>
-              <td class="value">{description}</td>
-            </tr>
-            <tr>
-              <td class="label">Date Incurred</td>
-              <td class="value">{date}</td>
-            </tr>
-            <tr>
-              <td class="label">Paid Originally By</td>
-              <td class="value">{payer_name}</td>
-            </tr>
-            <tr>
-              <td class="label">Total Bill Amount</td>
-              <td class="value">{formatted_total}</td>
-            </tr>
-          </table>
-
-          <div class="instruction-box">
-            <strong>Settlement instructions:</strong> Please settle up with <strong>{payer_name}</strong> via your preferred payment app (UPI, GPay, Cash, Bank Transfer, or Venmo). Once paid, the balance can be recorded in your circle ledger.
+        </td></tr>
+        <tr><td style="padding:20px 32px 0 32px;">
+          <div style="font-size:15px;color:{ink};">Hi {e(statement['name'])},</div>
+          <div style="font-size:14px;line-height:1.55;color:{muted};margin-top:8px;">
+            This is a friendly reminder about your outstanding balance. The oldest open item is from
+            {e(_fmt_date(statement['oldest_due']))} ({e(_days_phrase(statement['days_outstanding']))} ago).
           </div>
-        </div>
-        <div class="email-footer">
-          Sent automatically via Smart Budgeter &bull; Debt-Splitter Pro<br>
-          Keep circle expenses clear, balanced, and fair.
-        </div>
-      </div>
-    </body>
-    </html>
-    """
-    return html
+        </td></tr>
+        <tr><td style="padding:20px 32px 0 32px;">
+          <div style="border:1px solid {line};border-radius:8px;padding:18px 20px;">
+            <div style="font-size:12px;color:{muted};">Total outstanding</div>
+            <div style="font-size:28px;font-weight:700;color:{ink};margin-top:2px;letter-spacing:-0.01em;">{e(fmt_money(statement['total_owed'], curr))}</div>
+          </div>
+        </td></tr>
+        {''.join(circle_blocks)}
+        <tr><td style="padding:20px 32px 28px 32px;font-size:13px;line-height:1.55;color:{muted};">
+          Once you've paid, ask the person you paid to record it in {e(APP_NAME)} and these reminders will stop.
+          <br><br>Thanks,<br>{e(sender_name)}
+        </td></tr>
+      </table>
+      <div style="font-size:11px;color:#9a9993;margin-top:14px;">Sent by {e(APP_NAME)} on behalf of your circle.</div>
+    </td></tr>
+  </table>
+</body>
+</html>"""
 
-def send_email(to_email, subject, plain_body, html_body=None, is_dry_run=True, smtp_config=None):
-    """
-    Dispatches a multipart plain/HTML email or safely simulates delivery in Dry-Run mode.
-    Returns: (success: bool, status_message: str, details: dict)
-    """
-    host, port, user, passwd, from_email = get_smtp_credentials(smtp_config)
-    
-    details = {
-        "to": to_email,
-        "from": from_email,
-        "subject": subject,
-        "is_dry_run": is_dry_run,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "plain_body": plain_body,
-        "html_body": html_body or ""
-    }
 
+# ---------------------------------------------------------------------------
+# Delivery
+# ---------------------------------------------------------------------------
+def _smtp_connect(creds, timeout=15):
+    if int(creds["port"]) == 465:
+        server = smtplib.SMTP_SSL(creds["host"], creds["port"], timeout=timeout)
+        server.ehlo()
+    else:
+        server = smtplib.SMTP(creds["host"], creds["port"], timeout=timeout)
+        server.ehlo()
+        if server.has_extn("starttls"):
+            server.starttls()
+            server.ehlo()
+    server.login(creds["user"], creds["pass"])
+    return server
+
+
+def send_email(to_email, subject, plain_body, html_body=None, is_dry_run=True, settings=None):
+    """Send (or simulate) a multipart email. Returns (success, message)."""
     if is_dry_run:
-        print(f"[DRY-RUN EMAIL] To: {to_email} | Subject: {subject}\n{plain_body}\n---")
-        return True, "Simulation Successful (Dry-Run mode: no actual email dispatched)", details
+        return True, f"Simulated email to {to_email} (dry-run, nothing sent)"
 
-    if not user or not passwd:
-        return False, "SMTP credentials (Username / App Password) are missing. Please configure them in Settings or use Dry-Run mode.", details
+    creds = get_smtp_credentials(settings)
+    if not creds["user"] or not creds["pass"]:
+        return False, "SMTP username or app password is missing. Add them under Reminders > Email delivery."
 
+    msg = MIMEMultipart("alternative")
+    msg["From"] = formataddr((creds["sender_name"], creds["from_email"]))
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=(creds["from_email"].split("@")[-1] or None))
+    msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+    if html_body:
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
     try:
-        msg = MIMEMultipart("alternative")
-        msg["From"] = from_email
-        msg["To"] = to_email
-        msg["Subject"] = subject
-
-        # Attach plain text fallback first
-        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-
-        # Attach rich HTML if provided
-        if html_body:
-            msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-        # Connect and send
-        with smtplib.SMTP(host, port, timeout=15) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(user, passwd)
+        with _smtp_connect(creds) as server:
             server.send_message(msg)
+        return True, f"Sent to {to_email}"
+    except Exception as e:  # smtplib raises a wide range of exceptions
+        return False, f"Could not send to {to_email}: {e}"
 
-        print(f"[SENT EMAIL] To: {to_email} | Subject: {subject}")
-        return True, f"Email delivered successfully to {to_email}", details
-    except Exception as e:
-        err_msg = f"Failed to send email to {to_email}: {str(e)}"
-        print(f"[EMAIL ERROR] {err_msg}")
-        return False, err_msg, details
 
-def test_smtp_connection(smtp_config=None, test_to_email=None):
-    """Tests the SMTP connection and credentials, optionally sending a test ping."""
-    host, port, user, passwd, from_email = get_smtp_credentials(smtp_config)
-    if not user or not passwd:
-        return False, "Missing SMTP Username or App Password."
-
+def test_smtp_connection(settings=None, test_to_email=None):
+    """Authenticate against the SMTP server and optionally send a short test email."""
+    creds = get_smtp_credentials(settings)
+    if not creds["user"] or not creds["pass"]:
+        return False, "SMTP username and app password are required."
     try:
-        with smtplib.SMTP(host, port, timeout=12) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(user, passwd)
-            
+        with _smtp_connect(creds, timeout=12) as server:
             if test_to_email:
-                test_msg = MIMEText("This is a test notification confirming your Smart Budgeter email setup works perfectly!", "plain")
-                test_msg["From"] = from_email
-                test_msg["To"] = test_to_email
-                test_msg["Subject"] = "Smart Budgeter - SMTP Connection Verified"
-                server.send_message(test_msg)
-                return True, f"Connected to {host}:{port} and dispatched test email to {test_to_email}!"
-            return True, f"Successfully authenticated with SMTP host {host}:{port} as {user}."
+                msg = MIMEText(f"Your {APP_NAME} email settings are working.", "plain", "utf-8")
+                msg["From"] = formataddr((creds["sender_name"], creds["from_email"]))
+                msg["To"] = test_to_email
+                msg["Subject"] = f"{APP_NAME}: test email"
+                server.send_message(msg)
+                return True, f"Connected to {creds['host']}:{creds['port']} and sent a test email to {test_to_email}."
+        return True, f"Signed in to {creds['host']}:{creds['port']} as {creds['user']}."
     except Exception as e:
-        return False, f"SMTP Connection Failed: {str(e)}"
+        return False, f"Connection failed: {e}"
 
-def send_single_split_reminder(split, is_dry_run=True, smtp_config=None, curr="₹"):
+
+# ---------------------------------------------------------------------------
+# Queue & dispatch
+# ---------------------------------------------------------------------------
+def _parse_ts(ts):
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def get_reminder_queue(group_id=None, settings=None, now=None):
     """
-    Sends an email reminder for an individual split item.
+    Every person who owes money, annotated with whether they're due a reminder:
+      status in {"due", "cooldown", "not_overdue", "below_min", "no_email"}
+    plus last_reminded (datetime or None) and next_eligible (date or None).
     """
-    debtor_name = split.get("debtor_name", "Friend")
-    payer_name = split.get("payer_name", "a group member")
-    description = split.get("description", "Shared Expense")
-    amount = split.get("amount_owed", 0.0)
-    date = split.get("date", "")
-    total = split.get("total", amount)
-    group_name = split.get("group_name", "")
-    debtor_email = split.get("debtor_email")
+    s = settings or get_settings()
+    now = now or datetime.now()
+    statements = logic.build_debtor_statements(group_id, today=now.date())
+    last_sent = db.get_last_reminder_times(("sent",))
+    cadence = max(0, int(s["cadence_days"]))
 
-    if not debtor_email:
-        return {
-            "success": False,
-            "to": "Missing Email",
-            "debtor": debtor_name,
-            "msg": f"Debtor '{debtor_name}' does not have an email address on file. Please update their profile.",
-            "subject": "",
-            "details": {}
-        }
+    for st in statements:
+        last = _parse_ts(last_sent.get(st["user_id"]))
+        st["last_reminded"] = last
+        next_ok = (last + timedelta(days=cadence)).date() if last else None
+        st["next_eligible"] = next_ok
+        if not st["email"]:
+            st["status"] = "no_email"
+        elif st["total_owed"] < float(s["min_amount"]):
+            st["status"] = "below_min"
+        elif st["days_outstanding"] < int(s["overdue_days"]):
+            st["status"] = "not_overdue"
+        elif next_ok and now.date() < next_ok:
+            st["status"] = "cooldown"
+        else:
+            st["status"] = "due"
+    return statements
 
-    subject = f"Friendly Reminder: {fmt_money(amount, curr)} for '{description}'"
-    plain_body = build_email_plain(debtor_name, payer_name, description, amount, date, total, group_name, curr)
-    html_body = build_email_html(debtor_name, payer_name, description, amount, date, total, group_name, curr)
 
-    ok, msg, details = send_email(debtor_email, subject, plain_body, html_body, is_dry_run=is_dry_run, smtp_config=smtp_config)
+def send_statement_reminder(statement, is_dry_run=True, settings=None, trigger="manual"):
+    """Render, send (or simulate) and log a reminder for one statement."""
+    s = settings or get_settings()
+    curr = s.get("currency") or "₹"
+    creds = get_smtp_credentials(s)
+    subject = build_subject(statement, curr)
+    group_id = statement["circles"][0]["group_id"] if len(statement["circles"]) == 1 else None
 
-    return {
-        "success": ok,
-        "to": debtor_email,
-        "debtor": debtor_name,
-        "amount": amount,
-        "desc": description,
-        "msg": msg,
-        "subject": subject,
-        "details": details
-    }
+    if not statement.get("email"):
+        ok, msg, status = False, f"{statement['name']} has no email address.", "skipped"
+    else:
+        plain = build_statement_plain(statement, curr, creds["sender_name"])
+        html_body = build_statement_html(statement, curr, creds["sender_name"])
+        ok, msg = send_email(statement["email"], subject, plain, html_body, is_dry_run=is_dry_run, settings=s)
+        status = ("simulated" if is_dry_run else "sent") if ok else "failed"
 
-def send_gentle_reminders(group_id=None, overdue_days=OVERDUE_DAYS, is_dry_run=None, smtp_config=None, curr="₹"):
-    """
-    Finds all overdue splits beyond the day threshold and dispatches email reminders.
-    """
+    db.log_reminder(statement["user_id"], group_id, statement["total_owed"], statement.get("email") or "",
+                    subject, status, trigger, msg)
+    return {"success": ok, "status": status, "name": statement["name"], "to": statement.get("email") or "",
+            "amount": statement["total_owed"], "subject": subject, "msg": msg}
+
+
+def run_reminders(group_id=None, trigger="manual", is_dry_run=None, settings=None, now=None):
+    """Send reminders to everyone whose status is "due". Returns a summary dict."""
+    s = settings or get_settings()
     if is_dry_run is None:
-        is_dry_run = DRY_RUN
+        is_dry_run = not s["live_mode"]
+    queue = get_reminder_queue(group_id, s, now)
+    due = [st for st in queue if st["status"] == "due"]
+    results = [send_statement_reminder(st, is_dry_run=is_dry_run, settings=s, trigger=trigger) for st in due]
+    ok = sum(1 for r in results if r["success"])
+    verb = "simulated" if is_dry_run else "sent"
+    if not due:
+        message = "Nobody is due a reminder right now."
+    else:
+        message = f"{ok} of {len(due)} reminder(s) {verb}."
+    return {"queue": queue, "results": results, "message": message, "dry_run": is_dry_run}
 
-    cutoff = (datetime.now() - timedelta(days=overdue_days)).strftime("%Y-%m-%d")
-    unpaid = logic.get_unpaid_splits(group_id)
-    overdue = [s for s in unpaid if s["date"] <= cutoff]
 
-    if not overdue:
-        return {
-            "overdue": [],
-            "sent": [],
-            "total_amount": 0.0,
-            "message": f"No overdue splits older than {overdue_days} day(s) (cutoff: {cutoff}). Everything is up to date!"
-        }
+# ---------------------------------------------------------------------------
+# Automatic schedule
+# ---------------------------------------------------------------------------
+def next_auto_run(settings=None, now=None):
+    """The next datetime the daily automatic run will fire, or None if disabled."""
+    s = settings or get_settings()
+    if not s["auto_enabled"]:
+        return None
+    now = now or datetime.now()
+    today_slot = now.replace(hour=int(s["send_hour"]), minute=0, second=0, microsecond=0)
+    if s.get("last_auto_run_date") == now.date().isoformat():
+        return today_slot + timedelta(days=1)
+    # Past the send hour but not yet run today: due now (picked up on the next check).
+    return today_slot if now < today_slot else now
 
-    sent = []
-    total_amount = sum(float(s["amount_owed"]) for s in overdue)
 
-    for s in overdue:
-        res = send_single_split_reminder(s, is_dry_run=is_dry_run, smtp_config=smtp_config, curr=curr)
-        sent.append(res)
+def run_due_auto_reminders(now=None):
+    """
+    Run today's automatic reminders if enabled and past the send hour. Safe to call often
+    and from several processes: the run is claimed atomically, so it happens once per day.
+    Returns the run summary, or None when nothing was due.
+    """
+    s = get_settings()
+    if not s["auto_enabled"]:
+        return None
+    now = now or datetime.now()
+    if now.hour < int(s["send_hour"]):
+        return None
+    today = now.date().isoformat()
+    previous = s.get("last_auto_run_date")
+    if previous == today:
+        return None
+    if not db.compare_and_set_setting("last_auto_run_date", previous, today):
+        return None  # another process claimed it
+    s["last_auto_run_date"] = today
+    return run_reminders(trigger="auto", settings=s, now=now)
 
-    success_count = sum(1 for r in sent if r["success"])
-    mode_text = "simulated (dry-run)" if is_dry_run else "dispatched"
-    summary_message = f"Processed {len(overdue)} overdue split(s). {success_count}/{len(overdue)} reminders {mode_text}."
 
-    return {
-        "overdue": overdue,
-        "sent": sent,
-        "total_amount": total_amount,
-        "message": summary_message
-    }
+_scheduler_lock = threading.Lock()
+_scheduler_thread = None
 
-def print_overdue_summary(group_id=None):
-    """CLI summary printer."""
-    unpaid = logic.get_unpaid_splits(group_id)
-    if not unpaid:
-        print("No unpaid splits found.")
+
+def start_background_scheduler(interval_seconds=300):
+    """Start (once per process) a daemon thread that checks the schedule every few minutes."""
+    global _scheduler_thread
+    with _scheduler_lock:
+        if _scheduler_thread and _scheduler_thread.is_alive():
+            return _scheduler_thread
+
+        def loop():
+            while True:
+                try:
+                    res = run_due_auto_reminders()
+                    if res:
+                        print(f"[reminders] automatic run: {res['message']}", flush=True)
+                except Exception as e:  # keep the scheduler alive no matter what
+                    print(f"[reminders] automatic run failed: {e}", flush=True)
+                time.sleep(interval_seconds)
+
+        _scheduler_thread = threading.Thread(target=loop, name="reminder-scheduler", daemon=True)
+        _scheduler_thread.start()
+        return _scheduler_thread
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def print_summary(group_id=None):
+    s = get_settings()
+    curr = s.get("currency") or "₹"
+    queue = get_reminder_queue(group_id, s)
+    if not queue:
+        print("Nobody owes anything. All circles are settled.")
         return
-    print(f"\nUnpaid Splits Tracker ({len(unpaid)} items):")
-    cutoff = (datetime.now() - timedelta(days=OVERDUE_DAYS)).strftime("%Y-%m-%d")
-    for s in unpaid:
-        is_over = s["date"] <= cutoff
-        status = "⚠️ OVERDUE" if is_over else "⏳ PENDING"
-        email_str = f"[{s.get('debtor_email') or 'NO EMAIL'}]"
-        print(f"  [{status}] {s['debtor_name']} {email_str} owes {fmt_money(s['amount_owed'])} to {s['payer_name']} for '{s['description']}' ({s['date']})")
-    print()
+    labels = {"due": "DUE", "cooldown": "COOLDOWN", "not_overdue": "NOT OVERDUE",
+              "below_min": "BELOW MIN", "no_email": "NO EMAIL"}
+    print(f"\nOutstanding balances ({len(queue)}):")
+    for st in queue:
+        print(f"  [{labels[st['status']]:>11}] {st['name']:<20} {fmt_money(st['total_owed'], curr):>14}"
+              f"  oldest {st['oldest_due']} ({st['days_outstanding']}d)  {st['email'] or '-'}")
+    nxt = next_auto_run(s)
+    print(f"\nAutomatic reminders: {'on' if s['auto_enabled'] else 'off'}"
+          f"{' - next run ' + nxt.strftime('%Y-%m-%d %H:%M') if nxt else ''}"
+          f" | mode: {'live' if s['live_mode'] else 'dry-run'}\n")
+
 
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(description="Smart Budgeter - Automated Email Reminder Engine")
-    p.add_argument("--group", type=int, default=None, help="Group ID filter")
-    p.add_argument("--overdue-days", type=int, default=OVERDUE_DAYS, help="Overdue threshold in days")
-    p.add_argument("--live", action="store_true", help="Send live emails (disables dry-run mode)")
-    p.add_argument("--summary", action="store_true", help="Print summary without dispatching")
+
+    p = argparse.ArgumentParser(description=f"{APP_NAME} payment reminders")
+    p.add_argument("--group", type=int, default=None, help="Limit to one circle (group id)")
+    p.add_argument("--summary", action="store_true", help="Show balances and reminder status, send nothing")
+    p.add_argument("--run-now", action="store_true", help="Send reminders to everyone currently due")
+    p.add_argument("--auto", action="store_true", help="Run today's scheduled reminders if due (for cron)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--live", action="store_true", help="Force live sending for this run")
+    mode.add_argument("--dry-run", action="store_true", help="Force dry-run for this run")
     args = p.parse_args()
 
     db.init_db()
-    if args.summary:
-        print_overdue_summary(args.group)
-    else:
-        res = send_gentle_reminders(args.group, args.overdue_days, is_dry_run=not args.live)
+    if args.auto:
+        res = run_due_auto_reminders()
+        print(res["message"] if res else "No automatic run due (disabled, before send hour, or already ran today).")
+    elif args.run_now:
+        forced = True if args.dry_run else (False if args.live else None)
+        res = run_reminders(args.group, trigger="cli", is_dry_run=forced)
+        for r in res["results"]:
+            print(f"  [{r['status']}] {r['name']} <{r['to']}> {r['msg']}")
         print(res["message"])
+    else:
+        print_summary(args.group)
