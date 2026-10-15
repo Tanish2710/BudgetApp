@@ -1,1480 +1,1394 @@
 """
-app.py - Smart Budgeter | Institutional Financial Command Center
-High-performance personal expenditure tracking, Splitwise-style circle bill allocation,
-debt simplification algorithms, cash flow telemetry, and automated email statements.
+app.py - Smart Budgeter
+
+Personal budgeting (expenses, income, monthly and category budgets, reports) and
+shared expenses (circles, bill splitting, settle-up suggestions, payment reminders).
 """
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime, date, timedelta
+import html
 import os
 import sys
+from datetime import date, datetime, timedelta
 
-# Ensure local module discovery
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import database as db
-import logic
-import reminders
+import pandas as pd
+import streamlit as st
 
-# --- Page Configuration ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
+import charts  # noqa: E402
+import database as db  # noqa: E402
+import logic  # noqa: E402
+import reminders  # noqa: E402
+
 st.set_page_config(
-    page_title="Smart Budgeter — Financial Operations",
-    page_icon="■",
+    page_title="Smart Budgeter",
+    page_icon=":material/account_balance_wallet:",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Idempotent DB initialization
+
 @st.cache_resource(show_spinner=False)
-def _init_db_once():
+def _bootstrap():
+    """Runs once per server process: create/migrate the schema and start the reminder scheduler."""
     db.init_db()
+    reminders.start_background_scheduler()
     return True
 
-_init_db_once()
 
-# --- Session State Initialization ---
-if "currency" not in st.session_state:
-    st.session_state["currency"] = "₹"
-if "settle_prefill" not in st.session_state:
-    st.session_state["settle_prefill"] = None
-if "selected_tab" not in st.session_state:
-    st.session_state["selected_tab"] = "Overview"
-if "smtp_config" not in st.session_state:
-    st.session_state["smtp_config"] = {
-        "host": reminders.DEFAULT_SMTP_HOST,
-        "port": reminders.DEFAULT_SMTP_PORT,
-        "user": reminders.DEFAULT_SMTP_USER,
-        "pass": reminders.DEFAULT_SMTP_PASS,
-        "from_email": reminders.DEFAULT_FROM_EMAIL
-    }
-if "last_reminder_results" not in st.session_state:
-    st.session_state["last_reminder_results"] = None
+_bootstrap()
 
-CURR = st.session_state["currency"]
+SETTINGS = reminders.get_settings()
+CURR = SETTINGS.get("currency") or "₹"
+CURRENCIES = ["₹", "$", "€", "£", "¥"]
 
-# --- Institutional Design System (Non-gimmicky, authoritative, muted palette) ---
+# ---------------------------------------------------------------------------
+# Styles (layered on the theme in .streamlit/config.toml)
+# ---------------------------------------------------------------------------
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
-    
-    /* Base Reset & Architecture */
-    html, body, .stApp {
-        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
-        background-color: #0A0D14 !important;
-        color: #E2E8F0 !important;
-        -webkit-font-smoothing: antialiased;
-        letter-spacing: -0.01em;
-    }
+  :root {
+    --ink: #1a1a19; --ink-2: #52514e; --muted: #898781;
+    --line: #e3e2dc; --surface: #ffffff; --plane: #f7f7f5; --track: #efeee9;
+    --accent: #2a78d6; --pos: #006300; --neg: #b42318; --warn: #a15c00;
+  }
+  .block-container { max-width: 1240px; padding-top: 2.4rem; padding-bottom: 4rem; }
+  footer, [data-testid="stAppDeployButton"] { display: none !important; }
+  h1, h2, h3, h4 { letter-spacing: -0.015em; }
 
-    /* Strict Typography Enforcement */
-    p, h1, h2, h3, h4, h5, h6, label, input, select, textarea, div[data-testid="stMarkdownContainer"] {
-        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif !important;
-    }
+  /* Bordered containers read as white cards on the off-white page */
+  [data-testid="stLayoutWrapper"] > [data-testid="stVerticalBlock"] { background: var(--surface); }
 
-    /* Monospace for Numbers, Codes, and Balances */
-    .mono-num, .metric-amount, code, pre {
-        font-family: 'JetBrains Mono', 'Roboto Mono', 'SF Mono', monospace !important;
-        letter-spacing: -0.02em;
-    }
+  .page-head { margin: 0 0 1.25rem 0; }
+  .page-head h1 { font-size: 1.55rem; font-weight: 700; margin: 0; padding: 0; color: var(--ink); }
+  .page-head p { margin: .25rem 0 0 0; color: var(--ink-2); font-size: .92rem; }
 
-    /* Streamlit Global Header & Layout Tightening */
-    header[data-testid="stHeader"] {
-        background: rgba(10, 13, 20, 0.90) !important;
-        backdrop-filter: blur(12px) !important;
-        border-bottom: 1px solid #1E2638 !important;
-        z-index: 99999 !important;
-        visibility: visible !important;
-        display: flex !important;
-    }
+  .section-title { font-size: .98rem; font-weight: 600; color: var(--ink); margin: 0 0 .1rem 0; }
+  .section-sub { font-size: .82rem; color: var(--muted); margin: 0 0 .6rem 0; }
 
-    /* Ensure Streamlit Toolbar and Deploy button remain prominently visible */
-    [data-testid="stToolbar"],
-    [data-testid="stDeployButton"],
-    [data-testid="stToolbarActions"] {
-        visibility: visible !important;
-        display: flex !important;
-    }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; height: 100%; min-height: 124px; }
+  .tile-label { font-size: .78rem; font-weight: 500; color: var(--ink-2); }
+  .tile-value { font-size: 1.55rem; font-weight: 650; color: var(--ink); margin: 4px 0 2px 0;
+                letter-spacing: -0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile-sub { font-size: .8rem; color: var(--muted); }
+  .tone-pos { color: var(--pos) !important; }
+  .tone-neg { color: var(--neg) !important; }
+  .tone-warn { color: var(--warn) !important; }
+  .meter { height: 6px; background: var(--track); border-radius: 3px; margin: 8px 0 6px 0; overflow: hidden; }
+  .meter > span { display: block; height: 100%; border-radius: 3px; }
 
-    .block-container {
-        padding-top: 3.2rem !important;
-        padding-bottom: 3rem !important;
-        max-width: 1380px !important;
-    }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+         padding: 10px 0; border-bottom: 1px solid var(--track); }
+  .row:last-child { border-bottom: none; }
+  .row-main { font-size: .9rem; color: var(--ink); font-weight: 500; }
+  .row-meta { font-size: .78rem; color: var(--muted); margin-top: 1px; }
+  .row-amt { font-size: .92rem; font-weight: 600; color: var(--ink); white-space: nowrap;
+             font-variant-numeric: tabular-nums; }
 
-    /* Sidebar Background & Border */
-    [data-testid="stSidebar"] {
-        background-color: #07090E !important;
-        border-right: 1px solid #181F2E !important;
-    }
+  .chip { display: inline-block; font-size: .72rem; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+          border: 1px solid var(--line); color: var(--ink-2); background: var(--plane); white-space: nowrap; }
+  .chip-pos { color: var(--pos); background: #eef7ee; border-color: #cfe6cf; }
+  .chip-neg { color: var(--neg); background: #fdf1ef; border-color: #f4d3cd; }
+  .chip-warn { color: var(--warn); background: #fdf6e7; border-color: #f1dfb5; }
+  .chip-blue { color: #1c5cab; background: #eef4fc; border-color: #cfe0f6; }
 
-    /* Top Navigation Toolbar */
-    .top-toolbar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 12px 18px;
-        background: #111622;
-        border: 1px solid #1E2638;
-        border-radius: 8px;
-        margin-bottom: 20px;
-    }
-
-    .brand-title {
-        font-size: 1.05rem;
-        font-weight: 800;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-        color: #F8FAFC;
-    }
-
-    .brand-sub {
-        font-size: 0.68rem;
-        font-weight: 600;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-        color: #64748B;
-    }
-
-    /* Executive Metric Strip Cards */
-    .metric-strip-card {
-        background: #111622;
-        border: 1px solid #1E2638;
-        border-radius: 8px;
-        padding: 16px 18px;
-        transition: border-color 0.15s ease;
-        height: 100%;
-        min-height: 110px;
-        display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-    }
-
-    .metric-strip-card:hover {
-        border-color: #2D374E;
-    }
-
-    .metric-hdr {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-    }
-
-    .metric-label-txt {
-        font-size: 0.68rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: #64748B;
-    }
-
-    .metric-val-txt {
-        font-size: 1.55rem;
-        font-weight: 700;
-        font-family: 'JetBrains Mono', monospace;
-        letter-spacing: -0.03em;
-        color: #F8FAFC;
-        margin: 6px 0 2px 0;
-    }
-
-    .metric-sub-txt {
-        font-size: 0.76rem;
-        color: #8B95A5;
-    }
-
-    .txt-emerald { color: #16A34A !important; }
-    .txt-rose    { color: #EF4444 !important; }
-    .txt-sky     { color: #60A5FA !important; }
-
-    /* Muted Institutional Status Badges */
-    .badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 5px;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 0.72rem;
-        font-weight: 600;
-        letter-spacing: 0.02em;
-        line-height: 1.2;
-    }
-    .badge-green { background: rgba(34, 197, 94, 0.08); color: #22C55E; border: 1px solid rgba(34, 197, 94, 0.20); }
-    .badge-red   { background: rgba(239, 68, 68, 0.08); color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.20); }
-    .badge-blue  { background: rgba(37, 99, 235, 0.08); color: #60A5FA; border: 1px solid rgba(37, 99, 235, 0.20); }
-    .badge-gray  { background: rgba(148, 163, 184, 0.08); color: #94A3B8; border: 1px solid rgba(148, 163, 184, 0.16); }
-    .badge-amber { background: rgba(245, 158, 11, 0.08); color: #F59E0B; border: 1px solid rgba(245, 158, 11, 0.20); }
-
-    /* Clean Navigation Tabs */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2px;
-        background: #111622;
-        padding: 3px;
-        border-radius: 6px;
-        border: 1px solid #1E2638;
-        margin-bottom: 22px;
-    }
-
-    .stTabs [data-baseweb="tab"] {
-        height: 34px;
-        padding: 0 14px;
-        background: transparent;
-        border-radius: 4px;
-        border: none;
-        color: #8B95A5;
-        font-weight: 600;
-        font-size: 0.82rem;
-        transition: all 0.12s ease;
-    }
-
-    .stTabs [data-baseweb="tab"]:hover {
-        background: rgba(255, 255, 255, 0.03);
-        color: #F8FAFC;
-    }
-
-    .stTabs [data-baseweb="tab"][aria-selected="true"] {
-        background: #182030;
-        color: #F8FAFC;
-        border: 1px solid #283348;
-        font-weight: 600;
-    }
-
-    .stTabs [data-baseweb="tab-highlight"],
-    .stTabs [data-baseweb="tab-border"] {
-        display: none !important;
-    }
-
-    /* Buttons: Restrained & Authoritative */
-    div.stButton > button {
-        border-radius: 6px !important;
-        font-weight: 600 !important;
-        font-size: 0.82rem !important;
-        letter-spacing: -0.01em !important;
-        transition: all 0.14s ease !important;
-    }
-
-    div.stButton > button[kind="primary"],
-    div.stButton > button[data-testid="stBaseButton-primary"] {
-        background: #2563EB !important;
-        color: #FFFFFF !important;
-        border: 1px solid #3B82F6 !important;
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3) !important;
-    }
-
-    div.stButton > button[kind="primary"]:hover,
-    div.stButton > button[data-testid="stBaseButton-primary"]:hover {
-        background: #1D4ED8 !important;
-        border-color: #60A5FA !important;
-    }
-
-    div.stButton > button[kind="secondary"],
-    div.stButton > button[data-testid="stBaseButton-secondary"] {
-        background: #181E2B !important;
-        border: 1px solid #283248 !important;
-        color: #CBD5E1 !important;
-    }
-
-    div.stButton > button[kind="secondary"]:hover,
-    div.stButton > button[data-testid="stBaseButton-secondary"]:hover {
-        background: #1F2637 !important;
-        border-color: #3B4764 !important;
-        color: #FFFFFF !important;
-    }
-
-    /* Container Card Surfaces */
-    [data-testid="stVerticalBlockBorderWrapper"] {
-        background-color: #111622 !important;
-        border-color: #1E2638 !important;
-        border-radius: 8px !important;
-    }
-
-    /* Streamlit Progress Bar */
-    div[data-testid="stProgress"] > div > div > div > div {
-        background: #2563EB !important;
-        border-radius: 3px !important;
-    }
-    div[data-testid="stProgress"] > div > div {
-        background: #1B2232 !important;
-        border-radius: 3px !important;
-    }
-
-    /* Forms, Inputs & Selectboxes */
-    div[data-baseweb="select"] > div,
-    div[data-baseweb="input"] > div,
-    div[data-baseweb="base-input"] > div,
-    .stTextInput input,
-    .stNumberInput input,
-    .stDateInput input,
-    .stSelectbox div[data-baseweb="select"] > div {
-        background-color: #151B28 !important;
-        border: 1px solid #232C3D !important;
-        color: #E2E8F0 !important;
-        border-radius: 6px !important;
-    }
-
-    div[data-baseweb="select"]:focus-within > div,
-    div[data-baseweb="input"]:focus-within > div {
-        border-color: #2563EB !important;
-        box-shadow: 0 0 0 1px #2563EB !important;
-    }
-
-    /* Dataframe wrapper styling */
-    div[data-testid="stDataFrame"] {
-        border: 1px solid #1E2638 !important;
-        border-radius: 6px !important;
-        background: #111622 !important;
-    }
-
-    /* Streamlit Input instructions suppression */
-    [data-testid="InputInstructions"],
-    div[data-testid*="InputInstructions"] {
-        display: none !important;
-    }
-
-    /* Streamlit default footer hide */
-    footer {
-        display: none !important;
-    }
+  .empty { text-align: center; padding: 36px 16px; color: var(--ink-2); }
+  .empty b { display: block; color: var(--ink); font-size: 1rem; margin-bottom: 4px; }
+  .muted { color: var(--muted); font-size: .82rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# Helper to format money cleanly
-def fmt(val):
-    if val is None:
-        return f"{CURR}0.00"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+esc = html.escape
+
+
+def fmt(v, decimals=2):
     try:
-        return f"{CURR}{float(val):,.2f}"
-    except (ValueError, TypeError):
-        return f"{CURR}0.00"
+        v = float(v or 0)
+    except (TypeError, ValueError):
+        v = 0.0
+    sign = "-" if v < -0.004 else ""
+    return f"{sign}{CURR}{abs(v):,.{decimals}f}"
 
-# --- Data Loading ---
+
+def fmt_signed(v, decimals=2):
+    return ("+" if v > 0.004 else "") + fmt(v, decimals)
+
+
+def nice_date(iso):
+    try:
+        return date.fromisoformat(str(iso)[:10]).strftime("%d %b %Y")
+    except ValueError:
+        return str(iso)
+
+
+def month_label(ym):
+    return datetime.strptime(ym, "%Y-%m").strftime("%B %Y")
+
+
+def money_col(label):
+    return st.column_config.NumberColumn(label, format=f"{CURR}%,.2f")
+
+
+def flash(msg, icon=":material/check_circle:"):
+    """Queue a toast that survives the rerun that follows a write."""
+    st.session_state.setdefault("_flash", []).append((msg, icon))
+
+
+def page_header(title, subtitle=""):
+    sub = f"<p>{esc(subtitle)}</p>" if subtitle else ""
+    st.markdown(f"<div class='page-head'><h1>{esc(title)}</h1>{sub}</div>", unsafe_allow_html=True)
+
+
+def section(title, subtitle=""):
+    st.markdown(f"<div class='section-title'>{esc(title)}</div>"
+                + (f"<div class='section-sub'>{esc(subtitle)}</div>" if subtitle else "<div style='height:6px'></div>"),
+                unsafe_allow_html=True)
+
+
+def tile(label, value, sub="", tone="", meter=None, meter_color=charts.SERIES[0]):
+    meter_html = ""
+    if meter is not None:
+        pct = max(0.0, min(1.0, meter)) * 100
+        meter_html = f"<div class='meter'><span style='width:{pct:.1f}%;background:{meter_color}'></span></div>"
+    st.markdown(
+        f"<div class='tile'><div class='tile-label'>{esc(label)}</div>"
+        f"<div class='tile-value {('tone-' + tone) if tone else ''}'>{esc(value)}</div>"
+        f"{meter_html}<div class='tile-sub'>{sub}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def chip(text, tone=""):
+    return f"<span class='chip {('chip-' + tone) if tone else ''}'>{esc(text)}</span>"
+
+
+def empty_state(title, body=""):
+    st.markdown(f"<div class='empty'><b>{esc(title)}</b>{esc(body)}</div>", unsafe_allow_html=True)
+
+
+def plot(fig):
+    st.plotly_chart(fig, width="stretch", config=charts.PLOTLY_CONFIG)
+
+
+def ensure_choice(key, options, default=None):
+    """Drop a stale session value (e.g. a deleted person or circle) before rendering a widget."""
+    if key in st.session_state and st.session_state[key] not in options:
+        del st.session_state[key]
+    if key not in st.session_state and options:
+        st.session_state[key] = default if default in options else options[0]
+
+
+for _msg, _icon in st.session_state.pop("_flash", []):
+    st.toast(_msg, icon=_icon)
+
+# ---------------------------------------------------------------------------
+# Data shared by every page
+# ---------------------------------------------------------------------------
 users = db.get_all_users()
-groups = db.get_all_groups()
-
 user_map = {u["user_id"]: u for u in users}
-user_name_to_id = {f"{u['name']} (#{u['user_id']})": u["user_id"] for u in users}
+groups = db.get_all_groups()
 group_map = {g["group_id"]: g for g in groups}
-group_name_to_id = {f"{g['group_name']} (#{g['group_id']})": g["group_id"] for g in groups}
+today = date.today()
+cur_month = today.strftime("%Y-%m")
 
-# --- Sidebar (Clean Institutional Navigation) ---
-with st.sidebar:
-    st.markdown("""
-        <div style="padding: 4px 0 12px 0; border-bottom: 1px solid #1E2638; margin-bottom: 14px;">
-            <div class="brand-title">Smart Budgeter</div>
-            <div class="brand-sub">Financial Command • Enterprise</div>
-        </div>
-    """, unsafe_allow_html=True)
+st.logo(os.path.join(BASE_DIR, "assets", "logo.svg"), icon_image=os.path.join(BASE_DIR, "assets", "mark.svg"), size="large")
 
-    st.markdown("<div style='font-size:0.7rem; font-weight:700; color:#64748B; text-transform:uppercase; margin-bottom:4px;'>Profile Scope</div>", unsafe_allow_html=True)
-    if users:
-        user_options = list(user_name_to_id.keys())
-        active_user_label = st.selectbox("Active Profile", options=user_options, index=0, label_visibility="collapsed")
-        active_user_id = user_name_to_id[active_user_label]
-        active_user = user_map[active_user_id]
-        
-        st.markdown(f"""
-            <div style="background:#111622; border:1px solid #1E2638; border-radius:6px; padding:10px 12px; margin-top:6px; margin-bottom:14px; font-size:0.75rem;">
-                <div style="color:#64748B;">Account: <span style="color:#CBD5E1; font-family:'JetBrains Mono',monospace;">{active_user.get('email') or 'No email'}</span></div>
-                <div style="color:#64748B; margin-top:3px;">Monthly Cap: <span style="color:#60A5FA; font-family:'JetBrains Mono',monospace;">{fmt(active_user.get('monthly_budget', 0))}</span></div>
-            </div>
-        """, unsafe_allow_html=True)
-    else:
-        active_user_id = None
-        active_user = None
-        st.warning("No users available.")
-
-    st.markdown("<div style='font-size:0.7rem; font-weight:700; color:#64748B; text-transform:uppercase; margin-bottom:4px;'>Circle Filter</div>", unsafe_allow_html=True)
-    circle_options = ["All Circles"] + list(group_name_to_id.keys())
-    active_circle_label = st.selectbox("Circle Scope", options=circle_options, label_visibility="collapsed")
-    active_group_id = group_name_to_id[active_circle_label] if active_circle_label != "All Circles" else None
-
-    st.divider()
-
-    # Quick Create Actions
-    with st.expander("Create Entity", expanded=False):
-        c_tab_u, c_tab_g = st.tabs(["User", "Circle"])
-        with c_tab_u:
-            with st.form("sidebar_create_user", clear_on_submit=True):
-                nu_name = st.text_input("Full Name", placeholder="e.g. Alex Morgan")
-                nu_email = st.text_input("Email Address", placeholder="alex@example.com")
-                nu_phone = st.text_input("Mobile Number (10 digits)", placeholder="9876543210", max_chars=10)
-                nu_budget = st.number_input(f"Monthly Budget ({CURR})", min_value=0.0, value=1500.0, step=100.0)
-                if st.form_submit_button("Add User", type="primary", width="stretch"):
-                    valid, err, c_em, c_ph = logic.validate_user_data(nu_name, nu_email, nu_phone)
-                    if not valid:
+# ---------------------------------------------------------------------------
+# First run
+# ---------------------------------------------------------------------------
+if not users:
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        st.write("")
+        page_header("Welcome to Smart Budgeter",
+                    "Track your spending against a budget, split bills with friends, and send payment reminders automatically.")
+        with st.container(border=True):
+            section("Create your profile", "You can add other people later from Settings.")
+            with st.form("onboard_user"):
+                n = st.text_input("Name", placeholder="e.g. Priya Sharma")
+                e = st.text_input("Email", placeholder="priya@example.com")
+                b = st.number_input(f"Monthly budget ({CURR})", min_value=0.0, value=40000.0, step=1000.0)
+                if st.form_submit_button("Create profile", type="primary", width="stretch"):
+                    ok, err, c_em, c_ph = logic.validate_user_data(n, e, None)
+                    if not ok:
                         st.error(err)
                     else:
-                        try:
-                            db.create_user(nu_name.strip(), c_em, c_ph, float(nu_budget))
-                            st.success(f"Added {nu_name.strip()}")
-                            st.rerun()
-                        except ValueError as ve:
-                            st.error(str(ve))
-                        except Exception as e:
-                            st.error(f"Error: {e}")
-
-        with c_tab_g:
-            with st.form("sidebar_create_circle", clear_on_submit=True):
-                ng_name = st.text_input("Circle Name", placeholder="e.g. Apartment 4B")
-                if st.form_submit_button("Create Circle", type="primary", width="stretch"):
-                    if ng_name.strip():
-                        try:
-                            gid = db.create_group(ng_name.strip())
-                            if active_user_id:
-                                db.add_member_to_group(gid, active_user_id)
-                            st.success(f"Circle '{ng_name}' created")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error: {e}")
-                    else:
-                        st.warning("Circle name required.")
-
-    # Data Utilities
-    with st.expander("System Utilities", expanded=False):
-        c_seed, c_reset = st.columns(2)
-        with c_seed:
-            if st.button("Load Demo", width="stretch", help="Load comprehensive dataset"):
-                db.seed_comprehensive_demo_data(reset=True)
-                st.success("Demo dataset loaded.")
-                st.rerun()
-        with c_reset:
-            if st.button("Reset DB", width="stretch", help="Reset all database tables"):
-                conn = db.get_db_connection()
-                for t in ["splits", "shared_expenses", "settlements", "group_members", "groups", "category_budgets", "incomes", "expenses", "users"]:
-                    conn.execute(f"DROP TABLE IF EXISTS {t}")
-                conn.commit()
-                conn.close()
-                db.init_db()
-                st.success("Database reset clean.")
-                st.rerun()
-
-# --- Onboarding Empty State ---
-if not users:
-    st.markdown("""
-        <div style="background:#111622; border:1px solid #1E2638; border-radius:8px; padding:48px 24px; text-align:center;">
-            <div style="font-size:1.4rem; font-weight:800; color:#F8FAFC; margin-bottom:8px;">Smart Budgeter</div>
-            <p style="color:#8B95A5; max-width:480px; margin:0 auto 20px auto; font-size:0.9rem; line-height:1.5;">
-                Enterprise personal finance management, shared expense allocation, debt simplification, and automated payment statements.
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c2:
-        if st.button("Initialize Sample Financial Dataset", type="primary", width="stretch"):
+                        db.create_user(n.strip(), c_em, c_ph, float(b))
+                        st.rerun()
+        st.markdown("<div class='muted' style='text-align:center;margin:12px 0 8px'>or</div>", unsafe_allow_html=True)
+        if st.button("Explore with sample data", width="stretch"):
             db.seed_comprehensive_demo_data(reset=True)
-            st.success("Sample data initialized.")
             st.rerun()
     st.stop()
 
-# --- Active User Financial Telemetry ---
-cur_month = datetime.now().strftime("%Y-%m")
-cur_month_name = datetime.now().strftime("%B %Y")
-bs = logic.get_budget_status(active_user_id, cur_month)
-cf = logic.get_cash_flow_summary(active_user_id, cur_month)
-user_balances = logic.compute_balances(active_group_id)
-user_net_balance = user_balances.get(active_user_id, 0.0)
+# ---------------------------------------------------------------------------
+# Sidebar: active profile
+# ---------------------------------------------------------------------------
+user_ids = [u["user_id"] for u in users]
+ensure_choice("active_user_id", user_ids)
+with st.sidebar:
+    st.selectbox("Viewing as", user_ids, format_func=lambda i: user_map[i]["name"], key="active_user_id")
 
-all_unpaid = logic.get_unpaid_splits(active_group_id)
-active_unpaid_owed_by_me = [s for s in all_unpaid if s["user_id"] == active_user_id]
-active_unpaid_owed_to_me = [s for s in all_unpaid if s["payer_id"] == active_user_id]
+ACTIVE_ID = st.session_state["active_user_id"]
+ACTIVE = user_map[ACTIVE_ID]
+FIRST_NAME = ACTIVE["name"].split()[0]
 
-# --- Dialog: Quick Settlement Payment ---
-@st.dialog("Record Settlement Payment")
-def quick_settle_modal(from_uid, to_uid, amount, default_note="", group_id=None):
-    from_name = user_map.get(from_uid, {}).get("name", f"User #{from_uid}")
-    to_name = user_map.get(to_uid, {}).get("name", f"User #{to_uid}")
-    st.markdown(f"""
-        <div style="background:#161C2A; border:1px solid #232C3D; border-radius:6px; padding:12px 16px; margin-bottom:14px;">
-            <div style="font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:#8B95A5; margin-bottom:4px;">Direction of Payment</div>
-            <div style="display:flex; justify-content:space-between; align-items:center; font-weight:700;">
-                <span style="color:#EF4444;">{from_name}</span>
-                <span style="color:#64748B;">&rarr;</span>
-                <span style="color:#16A34A;">{to_name}</span>
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-    with st.form("dlg_settle_form"):
-        s_amt = st.number_input(f"Amount ({CURR})", min_value=0.01, value=float(amount), step=1.0)
-        s_meth = st.selectbox("Settlement Method", ["UPI / Bank Transfer", "Cash", "Venmo", "Zelle", "Wire Transfer"])
-        s_note = st.text_input("Reference Note", value=default_note)
-        if st.form_submit_button("Confirm Payment & Clear Balance", type="primary", width="stretch"):
-            db.add_settlement(from_uid, to_uid, float(s_amt), group_id, s_note, s_meth)
-            st.session_state["settle_prefill"] = None
-            st.success(f"Recorded payment of {fmt(s_amt)}")
+
+# ---------------------------------------------------------------------------
+# Dialogs
+# ---------------------------------------------------------------------------
+@st.dialog("Record a payment")
+def record_payment_dialog(from_uid, to_uid, amount, group_id, note=""):
+    f_name = user_map.get(from_uid, {}).get("name", "Unknown")
+    t_name = user_map.get(to_uid, {}).get("name", "Unknown")
+    g_name = group_map.get(group_id, {}).get("group_name", "No circle")
+    st.markdown(
+        f"<div class='row' style='border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:12px'>"
+        f"<div><div class='row-main'>{esc(f_name)} &rarr; {esc(t_name)}</div><div class='row-meta'>{esc(g_name)}</div></div>"
+        f"<div class='row-amt'>{fmt(amount)}</div></div>",
+        unsafe_allow_html=True,
+    )
+    with st.form("dlg_payment"):
+        c1, c2 = st.columns(2)
+        amt = c1.number_input(f"Amount ({CURR})", min_value=0.01, value=float(round(amount, 2)), step=100.0, format="%.2f")
+        pay_date = c2.date_input("Date", value=today, max_value=today)
+        method = st.selectbox("Method", db.SETTLEMENT_METHODS)
+        ref = st.text_input("Note", value=note)
+        if st.form_submit_button("Record payment", type="primary", width="stretch"):
+            db.add_settlement(from_uid, to_uid, float(amt), group_id, ref.strip(), method,
+                              date=f"{pay_date.isoformat()} {datetime.now().strftime('%H:%M:%S')}")
+            flash(f"Recorded {fmt(amt)} from {f_name} to {t_name}")
             st.rerun()
 
-# --- Dialog: Statement Email Preview ---
-@st.dialog("Payment Statement Preview", width="large")
-def preview_email_modal(split_item):
-    debtor = split_item["debtor_name"]
-    payer = split_item["payer_name"]
-    desc = split_item["description"]
-    amt = split_item["amount_owed"]
-    dt = split_item["date"]
-    tot = split_item["total"]
-    grp = split_item.get("group_name", "")
-    to_email = split_item.get("debtor_email", "user@example.com")
 
-    subject = f"Payment Reminder: {fmt(amt)} for '{desc}'"
-    html_content = reminders.build_email_html(debtor, payer, desc, amt, dt, tot, grp, curr=CURR)
+@st.dialog("Reminder preview", width="large")
+def preview_reminder_dialog(statement):
+    s = reminders.get_settings()
+    creds = reminders.get_smtp_credentials(s)
+    st.markdown(
+        f"<div class='muted'>To <b style='color:var(--ink)'>{esc(statement['email'] or 'no email on file')}</b></div>"
+        f"<div class='muted' style='margin-bottom:10px'>Subject <b style='color:var(--ink)'>{esc(reminders.build_subject(statement, CURR))}</b></div>",
+        unsafe_allow_html=True,
+    )
+    st.html(reminders.build_statement_html(statement, CURR, creds["sender_name"]))
 
-    st.markdown(f"""
-        <div style="background:#111622; border:1px solid #1E2638; border-radius:6px; padding:12px 14px; margin-bottom:12px; font-size:0.82rem;">
-            <div><strong style="color:#64748B;">Recipient:</strong> <span style="font-family:'JetBrains Mono',monospace; color:#60A5FA;">{to_email}</span></div>
-            <div style="margin-top:2px;"><strong style="color:#64748B;">Subject:</strong> <span style="color:#F8FAFC;">{subject}</span></div>
-        </div>
-    """, unsafe_allow_html=True)
-    st.html(html_content)
 
-# --- Top Navigation Bar ---
-top_left, top_mid, top_right = st.columns([6, 3, 3], vertical_alignment="center")
+# ---------------------------------------------------------------------------
+# Page: Overview
+# ---------------------------------------------------------------------------
+def page_overview():
+    hour = datetime.now().hour
+    greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 18 else "Good evening")
+    page_header(f"{greeting}, {FIRST_NAME}", f"Your finances for {month_label(cur_month)}.")
 
-with top_left:
-    st.markdown(f"""
-        <div style="display:flex; align-items:center; gap:8px;">
-            <div style="width:8px; height:8px; background:#2563EB; border-radius:2px;"></div>
-            <span class="brand-title">Smart Budgeter</span>
-            <span class="badge badge-gray">Operations</span>
-        </div>
-    """, unsafe_allow_html=True)
+    bs = logic.get_budget_status(ACTIVE_ID, cur_month)
+    cf = logic.get_cash_flow_summary(ACTIVE_ID, cur_month)
+    shared_net = logic.compute_balances(None).get(ACTIVE_ID, 0.0)
+    my_groups = db.get_user_groups(ACTIVE_ID)
 
-with top_mid:
-    st.markdown(f"""
-        <div style="text-align:right; font-size:0.8rem; color:#64748B;">
-            Scope: <strong style="color:#CBD5E1;">{active_circle_label}</strong>
-        </div>
-    """, unsafe_allow_html=True)
-
-with top_right:
-    c_btn1, c_btn2 = st.columns([1, 1], vertical_alignment="center")
-    with c_btn1:
-        if active_unpaid_owed_by_me:
-            if st.button("Settle Balance", type="primary", width="stretch"):
-                d = active_unpaid_owed_by_me[0]
-                quick_settle_modal(active_user_id, d["payer_id"], d["amount_owed"], f"Payment for {d['description']}", active_group_id)
-        else:
-            st.markdown(f"<div style='text-align:center;'><span class='badge badge-green'>Settled Up</span></div>", unsafe_allow_html=True)
-    with c_btn2:
-        with st.popover("Preferences", width="stretch"):
-            st.markdown("##### Preferences")
-            curr_options = ["₹", "$", "€", "£", "¥"]
-            curr_idx = curr_options.index(st.session_state["currency"]) if st.session_state["currency"] in curr_options else 0
-            new_curr = st.selectbox("Base Currency", options=curr_options, index=curr_idx)
-            if new_curr != st.session_state["currency"]:
-                st.session_state["currency"] = new_curr
-                st.rerun()
-
-            st.divider()
-            st.markdown("##### Edit Account")
-            with st.form("popover_edit_profile"):
-                ep_name = st.text_input("Name", value=active_user["name"])
-                ep_email = st.text_input("Email", value=active_user.get("email") or "")
-                ep_phone = st.text_input("Mobile Number", value=active_user.get("phone") or "", max_chars=10)
-                ep_budget = st.number_input(f"Monthly Budget ({CURR})", min_value=0.0, value=float(active_user.get("monthly_budget") or 1000.0), step=100.0)
-                if st.form_submit_button("Save Changes", type="primary", width="stretch"):
-                    valid, err, c_em, c_ph = logic.validate_user_data(ep_name, ep_email, ep_phone, exclude_user_id=active_user_id)
-                    if not valid:
-                        st.error(err)
-                    else:
-                        db.update_user(active_user_id, name=ep_name, email=c_em, phone=c_ph, monthly_budget=float(ep_budget))
-                        st.success("Account profile updated.")
-                        st.rerun()
-
-# --- Clean Navigation Tabs ---
-tabs = st.tabs([
-    "Overview",
-    "Transactions",
-    "Shared Expenses",
-    "Settlements",
-    "Analytics",
-    "Email Reminders",
-    "Data & Export"
-])
-
-# =========================================================================
-# TAB 1: OVERVIEW (EXECUTIVE DASHBOARD)
-# =========================================================================
-with tabs[0]:
-    # Header strip for Overview
-    bal_sign = "+" if user_net_balance > 0 else ""
-    bal_badge = "badge-green" if user_net_balance >= 0 else "badge-red"
-    bal_text = f"Net Position: {bal_sign}{fmt(user_net_balance)}" if user_net_balance >= 0 else f"Net Position: {fmt(user_net_balance)}"
-
-    st.markdown(f"""
-        <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0 14px 0; border-bottom:1px solid #1E2638; margin-bottom:16px;">
-            <div>
-                <div style="font-size:1.1rem; font-weight:700; color:#F8FAFC;">Executive Dashboard &bull; {active_user['name']}</div>
-                <div style="font-size:0.78rem; color:#64748B; margin-top:2px;">Reporting Period: {cur_month_name} &bull; Circle: {active_circle_label}</div>
-            </div>
-            <div style="display:flex; gap:8px;">
-                <span class="badge {bal_badge}">{bal_text}</span>
-                <span class="badge badge-blue">{len(active_unpaid_owed_by_me)} pending obligation(s)</span>
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-
-    # 4 Key Minimalist Metrics
     k1, k2, k3, k4 = st.columns(4)
-
     with k1:
-        pct_used = bs["pct_used"]
-        spend_color = "txt-emerald" if pct_used < 75 else ("txt-sky" if pct_used <= 90 else "txt-rose")
-        st.markdown(f"""
-            <div class="metric-strip-card">
-                <div>
-                    <div class="metric-label-txt">Monthly Spend</div>
-                    <div class="metric-val-txt {spend_color}">{fmt(bs['spent'])}</div>
-                </div>
-                <div class="metric-sub-txt">Budget: {fmt(bs['budget'])} ({pct_used}% utilized)</div>
-            </div>
-        """, unsafe_allow_html=True)
-
+        if bs["budget"] > 0:
+            over = bs["spent"] > bs["budget"]
+            tile("Spent this month", fmt(bs["spent"]),
+                 f"{bs['pct_used']:.0f}% of {fmt(bs['budget'], 0)} budget",
+                 meter=bs["spent"] / bs["budget"], meter_color=charts.CRITICAL if over else charts.SERIES[0])
+        else:
+            tile("Spent this month", fmt(bs["spent"]), "No monthly budget set")
     with k2:
-        net_cf = cf["net_cashflow"]
-        cf_color = "txt-emerald" if net_cf >= 0 else "txt-rose"
-        cf_sign = "+" if net_cf >= 0 else ""
-        st.markdown(f"""
-            <div class="metric-strip-card">
-                <div>
-                    <div class="metric-label-txt">Net Cash Flow</div>
-                    <div class="metric-val-txt {cf_color}">{cf_sign}{fmt(net_cf)}</div>
-                </div>
-                <div class="metric-sub-txt">Income: {fmt(cf['total_income'])} &bull; Savings: {cf['savings_rate']}%</div>
-            </div>
-        """, unsafe_allow_html=True)
-
+        tile("Net cash flow", fmt_signed(cf["net_cashflow"]),
+             f"Income {fmt(cf['total_income'], 0)} &middot; {cf['savings_rate']:.0f}% saved",
+             tone="pos" if cf["net_cashflow"] > 0 else ("neg" if cf["net_cashflow"] < 0 else ""))
     with k3:
-        safe_daily = bs["safe_daily_spend"]
-        pacing_status = "On Track" if not bs["is_pacing_fast"] else "Pacing Fast"
-        st.markdown(f"""
-            <div class="metric-strip-card">
-                <div>
-                    <div class="metric-label-txt">Safe Daily Spend</div>
-                    <div class="metric-val-txt txt-sky">{fmt(safe_daily)}</div>
-                </div>
-                <div class="metric-sub-txt">{bs['days_remaining']} days remaining &bull; {pacing_status}</div>
-            </div>
-        """, unsafe_allow_html=True)
-
+        if bs["budget"] > 0:
+            if bs["is_over_budget"]:
+                sub, tone = f"Over budget by {fmt(-bs['remaining'], 0)}", "neg"
+            elif bs["is_pacing_fast"]:
+                sub, tone = f"{bs['days_remaining']} days left &middot; on pace for {fmt(bs['projected_spend'], 0)}", "warn"
+            else:
+                sub, tone = f"{bs['days_remaining']} days left &middot; on track", ""
+            tile("Daily allowance", fmt(bs["safe_daily_spend"]), sub, tone=tone if tone == "neg" else "")
+        else:
+            tile("Daily allowance", "—", "Set a monthly budget to see this")
     with k4:
-        bal_color = "txt-emerald" if user_net_balance > 0 else ("txt-rose" if user_net_balance < 0 else "txt-sky")
-        bal_desc = "Owed to you" if user_net_balance > 0 else ("You owe others" if user_net_balance < 0 else "Settled")
-        bal_sign_k = "+" if user_net_balance > 0 else ""
-        st.markdown(f"""
-            <div class="metric-strip-card">
-                <div>
-                    <div class="metric-label-txt">Circle Balance</div>
-                    <div class="metric-val-txt {bal_color}">{bal_sign_k}{fmt(user_net_balance)}</div>
-                </div>
-                <div class="metric-sub-txt">{bal_desc}</div>
-            </div>
-        """, unsafe_allow_html=True)
+        if shared_net > 0.01:
+            tile("Shared balance", fmt(shared_net), f"You're owed &middot; {len(my_groups)} circle(s)", tone="pos")
+        elif shared_net < -0.01:
+            tile("Shared balance", fmt(-shared_net), f"You owe &middot; {len(my_groups)} circle(s)", tone="neg")
+        else:
+            tile("Shared balance", fmt(0), f"All settled &middot; {len(my_groups)} circle(s)")
+
+    cat_status = logic.get_category_budget_status(ACTIVE_ID, cur_month)
+    over_cats = [c for c in cat_status if c["has_budget"] and c["spent"] > c["budget"]]
+    if over_cats:
+        names = ", ".join(f"{c['category']} (by {fmt(c['spent'] - c['budget'], 0)})" for c in over_cats)
+        st.warning(f"Over the limit this month: {names}", icon=":material/error:")
 
     st.write("")
-
-    # Visual Analytics Row
-    col_pacing, col_donut = st.columns([3, 2])
-
-    with col_pacing:
+    left, right = st.columns([3, 2], gap="medium")
+    with left:
         with st.container(border=True):
-            st.markdown("##### Budget Health & Category Pacing")
-            b_pct = min(1.0, max(0.0, bs["spent"] / bs["budget"])) if bs["budget"] > 0 else 0.0
-            st.progress(b_pct)
-            
-            p1, p2, p3 = st.columns(3)
-            with p1: st.caption(f"Expenditure: **{fmt(bs['spent'])}**")
-            with p2: st.caption(f"Remaining: **{fmt(bs['remaining'])}**")
-            with p3: st.caption(f"Projected Total: **{fmt(bs['projected_spend'])}**")
-
-            cat_statuses = logic.get_category_budget_status(active_user_id, cur_month)
-            budgeted_cats = [c for c in cat_statuses if c["has_budget"]]
-            if budgeted_cats:
-                st.markdown("<div style='font-size:0.7rem; font-weight:700; color:#64748B; text-transform:uppercase; margin-top:12px; margin-bottom:6px;'>Allocated Category Limits</div>", unsafe_allow_html=True)
-                for cb in budgeted_cats[:4]:
-                    cb_pct = min(1.0, cb["spent"] / cb["budget"]) if cb["budget"] > 0 else 0.0
-                    c1, c2 = st.columns([3, 1])
-                    with c1:
-                        st.caption(f"{cb['category']}: {fmt(cb['spent'])} / {fmt(cb['budget'])}")
-                        st.progress(cb_pct)
-                    with c2:
-                        rem_label = f"{fmt(cb['remaining'])} left" if cb['remaining'] >= 0 else f"{fmt(abs(cb['remaining']))} over"
-                        c_color = "#16A34A" if cb['remaining'] >= 0 else "#EF4444"
-                        st.markdown(f"<div style='color:{c_color}; font-size:0.75rem; font-weight:600; text-align:right; font-family:monospace; padding-top:4px;'>{rem_label}</div>", unsafe_allow_html=True)
-
-    with col_donut:
-        with st.container(border=True):
-            st.markdown("##### Expenditure by Category")
-            cat_data = db.get_spending_by_category(active_user_id, cur_month)
-            if cat_data:
-                df_cat = pd.DataFrame(cat_data)
-                # Institutional corporate blue/teal/slate palette
-                fin_palette = ["#2563EB", "#3B82F6", "#60A5FA", "#0D9488", "#14B8A6", "#475569", "#64748B", "#94A3B8"]
-                fig_cat = px.pie(
-                    df_cat,
-                    names="category",
-                    values="total",
-                    hole=0.64,
-                    color_discrete_sequence=fin_palette,
-                    template="plotly_dark"
-                )
-                fig_cat.update_traces(textposition='outside', textinfo='percent+label', marker=dict(line=dict(color='#111622', width=1.5)))
-                fig_cat.update_layout(
-                    margin=dict(t=10, b=10, l=10, r=10),
-                    showlegend=False,
-                    height=260,
-                    font=dict(family="Plus Jakarta Sans, sans-serif", size=11),
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)"
-                )
-                st.plotly_chart(fig_cat, width="stretch")
+            section("Spending this month", "Cumulative spending against an even pace to your monthly budget.")
+            daily = db.get_daily_spending(ACTIVE_ID, cur_month)
+            if daily:
+                plot(charts.spending_pace(daily, cur_month, bs["budget"], CURR, bs["projected_spend"]))
             else:
-                st.caption(f"No expenditure records found for {cur_month_name}.")
-
-    # Recent Transactions Ledger
-    st.markdown("##### Recent Transactions")
-    user_recent_exp = db.get_expenses_filtered(user_id=active_user_id, limit=8)
-    if user_recent_exp:
-        recent_df = pd.DataFrame(user_recent_exp)
-        recent_display = recent_df[["date", "category", "description", "payment_method", "amount"]].copy()
-        recent_display["amount"] = recent_display["amount"].apply(lambda x: fmt(x))
-        recent_display.rename(columns={
-            "date": "Date", "category": "Category", "description": "Description",
-            "payment_method": "Method", "amount": "Amount"
-        }, inplace=True)
-        st.dataframe(recent_display, width="stretch", hide_index=True)
-    else:
-        st.caption("No transactions logged.")
-
-# =========================================================================
-# TAB 2: TRANSACTIONS (LOG & MANAGE)
-# =========================================================================
-with tabs[1]:
-    st.markdown("### Transaction Management")
-
-    log_type = st.segmented_control(
-        "Transaction Classification",
-        options=["Personal Expense", "Income Stream", "Shared Group Bill"],
-        default="Personal Expense"
-    )
-
-    if log_type == "Personal Expense":
+                empty_state("No spending yet this month", "")
+    with right:
         with st.container(border=True):
-            st.markdown("##### Record Personal Expenditure")
-            with st.form("form_personal_expense", clear_on_submit=True):
-                col_e1, col_e2, col_e3 = st.columns(3)
-                with col_e1:
-                    user_opts = list(user_name_to_id.keys())
-                    u_idx = list(user_name_to_id.values()).index(active_user_id) if active_user_id in user_name_to_id.values() else 0
-                    exp_user_name = st.selectbox("Account", options=user_opts, index=u_idx)
-                    exp_amt = st.number_input(f"Amount ({CURR})", min_value=0.01, value=25.0, step=1.0)
-                with col_e2:
-                    exp_cat = st.selectbox("Category", [
-                        "Food & Dining", "Housing & Rent", "Groceries", "Utilities",
-                        "Transportation", "Entertainment", "Health & Medical",
-                        "Shopping", "Travel", "Education", "Other"
-                    ])
-                    exp_date = st.date_input("Date Incurred", value=date.today())
-                with col_e3:
-                    exp_pmethod = st.selectbox("Payment Instrument", ["UPI / Bank Transfer", "Credit Card", "Debit Card", "Cash", "Corporate Card"])
-                    exp_desc = st.text_input("Description", placeholder="e.g. Lunch with Client")
+            section("By category", "Bars show spending; ticks mark your limits.")
+            if any(c["spent"] > 0 for c in cat_status):
+                plot(charts.category_vs_budget(cat_status, CURR, max_rows=7))
+            else:
+                empty_state("Nothing to show yet", "")
+            st.page_link(PAGE_BUDGETS, label="Manage budgets", icon=":material/arrow_forward:")
 
-                exp_notes = st.text_input("Reference Notes (Optional)", placeholder="e.g. #reimbursable, tax-deductible")
-
-                if st.form_submit_button("Record Expense", width="stretch", type="primary"):
-                    uid = user_name_to_id[exp_user_name]
-                    db.add_expense(uid, float(exp_amt), exp_cat, exp_date.isoformat(), exp_desc, exp_pmethod, exp_notes)
-                    st.success(f"Recorded expense of {fmt(exp_amt)}")
-                    st.rerun()
-
-    elif log_type == "Income Stream":
+    left, right = st.columns([3, 2], gap="medium")
+    with left:
         with st.container(border=True):
-            st.markdown("##### Record Inflow / Income Stream")
-            with st.form("form_income", clear_on_submit=True):
-                col_i1, col_i2, col_i3 = st.columns(3)
-                with col_i1:
-                    u_idx_inc = list(user_name_to_id.values()).index(active_user_id) if active_user_id in user_name_to_id.values() else 0
-                    inc_user_name = st.selectbox("Recipient Account", options=list(user_name_to_id.keys()), index=u_idx_inc)
-                    inc_amt = st.number_input(f"Amount ({CURR})", min_value=0.01, value=1000.0, step=50.0)
-                with col_i2:
-                    inc_source = st.selectbox("Source Category", ["Salary", "Freelance & Consulting", "Investments & Dividends", "Reimbursements", "Gifts", "Other"])
-                    inc_date = st.date_input("Date Received", value=date.today())
-                with col_i3:
-                    inc_desc = st.text_input("Source Description", placeholder="e.g. Monthly Payroll")
+            section("Recent activity")
+            exp = db.get_expenses_filtered(user_id=ACTIVE_ID, limit=8)
+            inc = db.get_incomes_filtered(user_id=ACTIVE_ID, limit=8)
+            rows = [{"Date": e["date"], "Description": e["description"] or e["category"], "Category": e["category"],
+                     "Amount": -e["amount"]} for e in exp]
+            rows += [{"Date": i["date"], "Description": i["description"] or i["source"], "Category": i["source"],
+                      "Amount": i["amount"]} for i in inc]
+            rows = sorted(rows, key=lambda r: r["Date"], reverse=True)[:8]
+            if rows:
+                df = pd.DataFrame(rows)
+                df["Date"] = pd.to_datetime(df["Date"])
+                df["Amount"] = df["Amount"].map(fmt_signed)
+                st.dataframe(df, hide_index=True, width="stretch", column_config={
+                    "Date": st.column_config.DateColumn("Date", format="DD MMM"),
+                    "Amount": st.column_config.TextColumn("Amount", alignment="right"),
+                })
+            else:
+                empty_state("No transactions yet", "")
+            st.page_link(PAGE_TRANSACTIONS, label="All transactions", icon=":material/arrow_forward:")
+    with right:
+        with st.container(border=True):
+            section("Shared balances", "Suggested payments involving you.")
+            plan = [t for t in logic.get_settlement_plan(None) if ACTIVE_ID in (t["from_user"], t["to_user"])]
+            if not plan:
+                empty_state("You're all settled up", "")
+            for i, t in enumerate(plan):
+                you_pay = t["from_user"] == ACTIVE_ID
+                c1, c2 = st.columns([3, 1], vertical_alignment="center")
+                with c1:
+                    who = f"You owe {esc(t['to_name'])}" if you_pay else f"{esc(t['from_name'])} owes you"
+                    st.markdown(f"<div class='row-main'>{who} <span class='{'tone-neg' if you_pay else 'tone-pos'}' style='font-weight:600'>{fmt(t['amount'])}</span></div>"
+                                f"<div class='row-meta'>{esc(t['group_name'])}</div>", unsafe_allow_html=True)
+                with c2:
+                    if st.button("Settle", key=f"ov_settle_{i}", width="stretch"):
+                        record_payment_dialog(t["from_user"], t["to_user"], t["amount"], t["group_id"],
+                                              f"{t['group_name']} settle-up")
+            st.page_link(PAGE_SETTLE, label="Settle up", icon=":material/arrow_forward:")
 
-                if st.form_submit_button("Record Inflow", width="stretch", type="primary"):
-                    uid = user_name_to_id[inc_user_name]
-                    db.add_income(uid, float(inc_amt), inc_source, inc_date.isoformat(), inc_desc)
-                    st.success(f"Recorded income of {fmt(inc_amt)}")
-                    st.rerun()
 
-    elif log_type == "Shared Group Bill":
-        if not groups:
-            st.warning("Please create a Circle first to split bills.")
+# ---------------------------------------------------------------------------
+# Page: Transactions
+# ---------------------------------------------------------------------------
+PERIODS = {
+    "This month": lambda: (today.replace(day=1), today),
+    "Last 30 days": lambda: (today - timedelta(days=29), today),
+    "Last 3 months": lambda: (db.month_start(today, 2), today),
+    "This year": lambda: (date(today.year, 1, 1), today),
+    "All time": lambda: (None, None),
+}
+
+
+def page_transactions():
+    page_header("Transactions", f"Record and review spending and income for {ACTIVE['name']}.")
+
+    with st.container(border=True):
+        kind = st.segmented_control("Add", ["Expense", "Income"], default="Expense", key="add_kind") or "Expense"
+        if kind == "Expense":
+            with st.form("add_expense", clear_on_submit=True):
+                c1, c2, c3 = st.columns(3)
+                amt = c1.number_input(f"Amount ({CURR})", min_value=0.01, value=None, step=100.0, format="%.2f",
+                                      placeholder="0.00")
+                cat = c2.selectbox("Category", db.EXPENSE_CATEGORIES)
+                d = c3.date_input("Date", value=today, max_value=today)
+                c4, c5, c6 = st.columns(3)
+                desc = c4.text_input("Description", placeholder="e.g. Groceries at Nature's Basket")
+                method = c5.selectbox("Paid with", db.PAYMENT_METHODS)
+                notes = c6.text_input("Notes", placeholder="Optional")
+                if st.form_submit_button("Add expense", type="primary"):
+                    if not amt:
+                        st.error("Enter an amount.")
+                    else:
+                        db.add_expense(ACTIVE_ID, float(amt), cat, d.isoformat(), desc.strip() or cat, method, notes.strip())
+                        flash(f"Added expense of {fmt(amt)}")
+                        st.rerun()
         else:
-            with st.container(border=True):
-                st.markdown("##### Create Shared Bill & Allocate Splits")
-                col_s1, col_s2, col_s3 = st.columns(3)
-                with col_s1:
-                    sel_grp_name = st.selectbox("Circle", options=list(group_name_to_id.keys()), index=0)
-                    chosen_gid = group_name_to_id[sel_grp_name]
-                    grp_members = db.get_group_members(chosen_gid)
-                    if not grp_members:
-                        st.warning("This circle has no active members.")
-                        grp_member_map = {}
-                        grp_member_names = []
+            with st.form("add_income", clear_on_submit=True):
+                c1, c2, c3 = st.columns(3)
+                amt = c1.number_input(f"Amount ({CURR})", min_value=0.01, value=None, step=1000.0, format="%.2f",
+                                      placeholder="0.00")
+                src = c2.selectbox("Source", db.INCOME_SOURCES)
+                d = c3.date_input("Date", value=today, max_value=today)
+                desc = st.text_input("Description", placeholder="e.g. October salary")
+                if st.form_submit_button("Add income", type="primary"):
+                    if not amt:
+                        st.error("Enter an amount.")
                     else:
-                        grp_member_map = {m["user_id"]: m["name"] for m in grp_members}
-                        grp_member_names = [f"{m['name']} (#{m['user_id']})" for m in grp_members]
-
-                if grp_members:
-                    with col_s2:
-                        payer_label = st.selectbox("Paid Originally By", options=grp_member_names)
-                        payer_uid = int(payer_label.split("#")[1].rstrip(")"))
-                        bill_total = st.number_input(f"Total Amount ({CURR})", min_value=0.01, value=60.0, step=5.0)
-                    with col_s3:
-                        bill_desc = st.text_input("Description", placeholder="e.g. Office Supplies, Travel Expense")
-                        bill_date = st.date_input("Expense Date", value=date.today())
-
-                    bill_category = st.selectbox("Expense Category", ["General", "Groceries", "Food & Dining", "Rent & Housing", "Utilities", "Travel", "Entertainment"])
-
-                    st.markdown("<div style='font-size:0.7rem; font-weight:700; color:#64748B; text-transform:uppercase; margin-top:10px; margin-bottom:4px;'>Allocation Method</div>", unsafe_allow_html=True)
-                    split_mode = st.radio(
-                        "Split Strategy",
-                        options=["Equal Split (=)", "Exact Amounts ($)", "Percentage (%)", "Weighted Shares (x)"],
-                        horizontal=True
-                    )
-
-                    participating_members = st.multiselect(
-                        "Participants Included in Allocation",
-                        options=grp_member_names,
-                        default=grp_member_names
-                    )
-
-                    custom_splits_to_save = None
-                    can_submit = True
-
-                    if not participating_members:
-                        st.warning("Please select at least one participant.")
-                        can_submit = False
-                    else:
-                        part_uids = [int(n.split("#")[1].rstrip(")")) for n in participating_members]
-                        n_parts = len(part_uids)
-
-                        if split_mode == "Equal Split (=)":
-                            per_head = round(bill_total / n_parts, 2)
-                            st.caption(f"Equal share: **{fmt(per_head)}** per participant.")
-                            custom_splits_to_save = None
-                        elif split_mode == "Exact Amounts ($)":
-                            cols = st.columns(min(4, n_parts))
-                            exact_dict = {}
-                            default_part = round(bill_total / n_parts, 2)
-                            for idx, p_label in enumerate(participating_members):
-                                u_id = int(p_label.split("#")[1].rstrip(")"))
-                                col_idx = idx % min(4, n_parts)
-                                with cols[col_idx]:
-                                    exact_val = st.number_input(f"{grp_member_map[u_id]} ({CURR})", min_value=0.0, value=default_part, step=1.0, key=f"ex_{u_id}")
-                                    exact_dict[u_id] = exact_val
-                            sum_exact = round(sum(exact_dict.values()), 2)
-                            if abs(round(bill_total - sum_exact, 2)) > 0.01:
-                                st.error(f"Sum of allocations ({fmt(sum_exact)}) does not equal total ({fmt(bill_total)}).")
-                                can_submit = False
-                            else:
-                                custom_splits_to_save = exact_dict
-                        elif split_mode == "Percentage (%)":
-                            cols = st.columns(min(4, n_parts))
-                            pct_dict = {}
-                            default_pct = round(100.0 / n_parts, 1)
-                            for idx, p_label in enumerate(participating_members):
-                                u_id = int(p_label.split("#")[1].rstrip(")"))
-                                col_idx = idx % min(4, n_parts)
-                                with cols[col_idx]:
-                                    pct_val = st.number_input(f"{grp_member_map[u_id]} (%)", min_value=0.0, max_value=100.0, value=default_pct, step=1.0, key=f"pct_{u_id}")
-                                    pct_dict[u_id] = pct_val
-                            if abs(round(sum(pct_dict.values()), 1) - 100.0) > 0.5:
-                                st.error("Percentages must sum to 100%.")
-                                can_submit = False
-                            else:
-                                custom_splits_to_save = {uid: round((p / 100.0) * bill_total, 2) for uid, p in pct_dict.items()}
-                        elif split_mode == "Weighted Shares (x)":
-                            cols = st.columns(min(4, n_parts))
-                            shares_dict = {}
-                            for idx, p_label in enumerate(participating_members):
-                                u_id = int(p_label.split("#")[1].rstrip(")"))
-                                col_idx = idx % min(4, n_parts)
-                                with cols[col_idx]:
-                                    sh_val = st.number_input(f"{grp_member_map[u_id]} (parts)", min_value=1, value=1, step=1, key=f"sh_{u_id}")
-                                    shares_dict[u_id] = sh_val
-                            tot_sh = sum(shares_dict.values())
-                            custom_splits_to_save = {uid: round((sh / tot_sh) * bill_total, 2) for uid, sh in shares_dict.items()}
-
-                    if st.button("Commit Shared Expense", type="primary", disabled=not can_submit, width="stretch"):
-                        try:
-                            if custom_splits_to_save:
-                                db.add_shared_expense(chosen_gid, payer_uid, float(bill_total), bill_desc or "Shared Bill", bill_date.isoformat(), custom_splits=custom_splits_to_save, category=bill_category)
-                            else:
-                                db.add_shared_expense(chosen_gid, payer_uid, float(bill_total), bill_desc or "Shared Bill", bill_date.isoformat(), split_among=part_uids, category=bill_category)
-                            st.success("Shared bill recorded and balances updated.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error: {e}")
-
-    # Ledger Filter & Records
-    st.divider()
-    st.markdown("##### Filterable Transaction Ledger")
-    tf_c1, tf_c2, tf_c3 = st.columns([2, 1, 1])
-    with tf_c1:
-        search_kw = st.text_input("Keyword Search", placeholder="Filter by description or notes...")
-    with tf_c2:
-        cat_filter = st.selectbox("Category", options=["All"] + db.get_distinct_categories())
-    with tf_c3:
-        user_filter_opt = st.selectbox("Account Filter", options=["All Accounts"] + list(user_name_to_id.keys()))
-        selected_uid_filter = user_name_to_id[user_filter_opt] if user_filter_opt != "All Accounts" else None
-
-    filtered_expenses = db.get_expenses_filtered(
-        user_id=selected_uid_filter,
-        category=cat_filter,
-        search=search_kw.strip() if search_kw else None,
-        limit=50
-    )
-
-    if filtered_expenses:
-        f_df = pd.DataFrame(filtered_expenses)
-        display_cols = ["exp_id", "date", "user_name", "category", "amount", "payment_method", "description", "notes"]
-        f_display = f_df[[c for c in display_cols if c in f_df.columns]].copy()
-        f_display["amount"] = f_display["amount"].apply(lambda x: fmt(x))
-        f_display.rename(columns={
-            "exp_id": "ID", "date": "Date", "user_name": "Account", "category": "Category",
-            "amount": "Amount", "payment_method": "Instrument", "description": "Description", "notes": "Notes"
-        }, inplace=True)
-        st.dataframe(f_display, width="stretch", hide_index=True)
-
-        with st.expander("Record Management (Delete Entry)", expanded=False):
-            del_options = [f"#{e['exp_id']} • {e['date']} • {e['user_name']} • {fmt(e['amount'])} ({e['description']})" for e in filtered_expenses]
-            sel_del = st.selectbox("Select Entry", options=del_options)
-            if st.button("Delete Selected Entry", type="secondary"):
-                del_id = int(sel_del.split("•")[0].replace("#", "").strip())
-                db.delete_expense(del_id)
-                st.success(f"Entry #{del_id} deleted.")
-                st.rerun()
-    else:
-        st.caption("No matching ledger records found.")
-
-# =========================================================================
-# TAB 3: SHARED EXPENSES (CIRCLES & BILL ALLOCATIONS)
-# =========================================================================
-with tabs[2]:
-    st.markdown("### Shared Expense Circles & Ledgers")
-    
-    if not groups:
-        st.caption("No circles registered. Create a circle using the sidebar.")
-    else:
-        for g in groups:
-            gid = g["group_id"]
-            members = db.get_group_members(gid)
-            member_ids = [m["user_id"] for m in members]
-            shared_bills = db.get_group_shared_expenses(gid)
-            total_shared_vol = sum(sb["amount"] for sb in shared_bills)
-
-            with st.expander(f"{g['group_name']} &bull; {len(members)} Members &bull; Volume: {fmt(total_shared_vol)}", expanded=(active_group_id == gid or len(groups) == 1)):
-                c_m1, c_m2 = st.columns([3, 1])
-                with c_m1:
-                    if members:
-                        chips_html = "".join([f"<span class='badge badge-gray' style='margin-right:6px;'>{m['name']}</span>" for m in members])
-                        st.markdown(f"**Circle Roster:** {chips_html}", unsafe_allow_html=True)
-                    else:
-                        st.caption("No members assigned to circle.")
-
-                    col_add, col_rm = st.columns(2)
-                    with col_add:
-                        eligible_to_add = [u for u in users if u["user_id"] not in member_ids]
-                        if eligible_to_add:
-                            add_options = [f"{u['name']} (#{u['user_id']})" for u in eligible_to_add]
-                            sel_to_add = st.selectbox("Add Member", options=["-- Select --"] + add_options, key=f"add_mem_{gid}")
-                            if st.button("Add Member", key=f"btn_add_{gid}") and sel_to_add != "-- Select --":
-                                to_add_id = int(sel_to_add.split("#")[1].rstrip(")"))
-                                db.add_member_to_group(gid, to_add_id)
-                                st.success("Member added.")
-                                st.rerun()
-                    with col_rm:
-                        if members:
-                            rm_options = [f"{m['name']} (#{m['user_id']})" for m in members]
-                            sel_to_rm = st.selectbox("Remove Member", options=["-- Select --"] + rm_options, key=f"rm_mem_{gid}")
-                            if st.button("Remove Member", key=f"btn_rm_{gid}") and sel_to_rm != "-- Select --":
-                                to_rm_id = int(sel_to_rm.split("#")[1].rstrip(")"))
-                                db.remove_member_from_group(gid, to_rm_id)
-                                st.success("Member removed.")
-                                st.rerun()
-
-                with c_m2:
-                    if st.button("Delete Circle", key=f"del_circle_{gid}"):
-                        db.delete_group(gid)
-                        st.success(f"Circle '{g['group_name']}' deleted.")
+                        db.add_income(ACTIVE_ID, float(amt), src, d.isoformat(), desc.strip() or src)
+                        flash(f"Added income of {fmt(amt)}")
                         st.rerun()
 
-                st.write("")
-                st.markdown(f"##### Group Bill Records ({len(shared_bills)})")
-                if shared_bills:
-                    for sb in shared_bills:
-                        with st.container(border=True):
-                            s_head1, s_head2, s_head3 = st.columns([3, 1, 1], vertical_alignment="center")
-                            with s_head1:
-                                st.markdown(f"**{sb['description']}** &bull; <span style='font-family:monospace; font-weight:700;'>{fmt(sb['amount'])}</span>", unsafe_allow_html=True)
-                                st.caption(f"Paid by {sb['payer_name']} on {sb['date']} &bull; Category: {sb.get('category', 'General')}")
-                            with s_head2:
-                                splits = db.get_splits_for_expense(sb["shared_id"])
-                                paid_count = sum(1 for s in splits if s["is_paid"])
-                                st.caption(f"Settlement: **{paid_count}/{len(splits)} paid**")
-                            with s_head3:
-                                if st.button("Delete Bill", key=f"del_sb_{sb['shared_id']}"):
-                                    db.delete_shared_expense(sb["shared_id"])
-                                    st.success("Record deleted.")
-                                    st.rerun()
-
-                            for s in splits:
-                                sp1, sp2, sp3 = st.columns([3, 1, 1], vertical_alignment="center")
-                                is_payer = s["user_id"] == sb["payer_id"]
-                                payer_note = " (Payer share)" if is_payer else ""
-                                with sp1:
-                                    st.caption(f"&bull; {s['user_name']}: {fmt(s['amount_owed'])}{payer_note}")
-                                with sp2:
-                                    if s["is_paid"]:
-                                        st.markdown("<span class='badge badge-green'>Paid</span>", unsafe_allow_html=True)
-                                    else:
-                                        st.markdown("<span class='badge badge-red'>Unpaid</span>", unsafe_allow_html=True)
-                                with sp3:
-                                    if not s["is_paid"]:
-                                        if st.button("Mark Paid", key=f"mk_paid_{s['split_id']}"):
-                                            db.mark_split_paid(s["split_id"], True)
-                                            st.rerun()
-                                    else:
-                                        if st.button("Mark Unpaid", key=f"mk_unpaid_{s['split_id']}"):
-                                            db.mark_split_paid(s["split_id"], False)
-                                            st.rerun()
-                else:
-                    st.caption("No shared expenses recorded in this circle.")
-
-# =========================================================================
-# TAB 4: SETTLEMENTS (DEBT SIMPLIFICATION ENGINE)
-# =========================================================================
-with tabs[3]:
-    st.markdown("### Debt Simplification & Settlement Operations")
-    st.caption("Greedy minimum cash-flow optimization resolves multi-party debts into the minimal direct transfer instructions.")
-
-    bal_details = logic.compute_balances_detailed(active_group_id)
-    if not bal_details:
-        st.caption("No outstanding balances in selected scope.")
+    st.write("")
+    section("History")
+    f1, f2, f3, f4 = st.columns([1.1, 2, 1.4, 1.3])
+    view = f1.segmented_control("Show", ["Expenses", "Income"], default="Expenses", key="ledger_view") or "Expenses"
+    search = f2.text_input("Search", placeholder="Description or notes", key="ledger_search")
+    if view == "Expenses":
+        cat = f3.selectbox("Category", ["All categories"] + db.get_distinct_categories(ACTIVE_ID), key="ledger_cat")
     else:
-        col_bal_t, col_bal_c = st.columns([1, 1])
-        with col_bal_t:
-            st.markdown("##### Net Balances Ledger")
-            df_b = pd.DataFrame(bal_details)
-            df_b_display = df_b[["name", "balance", "status"]].copy()
-            df_b_display["balance"] = df_b_display["balance"].apply(lambda x: fmt(x))
-            df_b_display.rename(columns={"name": "Member", "balance": "Net Balance", "status": "Position"}, inplace=True)
-            st.dataframe(df_b_display, width="stretch", hide_index=True)
+        cat = None
+        f3.empty()
+    period = f4.selectbox("Period", list(PERIODS), index=4, key="ledger_period")
+    start, end = PERIODS[period]()
+    s_iso = start.isoformat() if start else None
+    e_iso = end.isoformat() if end else None
 
-        with col_bal_c:
-            st.markdown("##### Net Position Visualization")
-            bar_colors = ["#16A34A" if b["balance"] > 0 else ("#DC2626" if b["balance"] < 0 else "#475569") for b in bal_details]
-            fig_bar = go.Figure(go.Bar(
-                x=[b["name"] for b in bal_details],
-                y=[b["balance"] for b in bal_details],
-                marker_color=bar_colors,
-                text=[fmt(b["balance"]) for b in bal_details],
-                textposition="outside"
-            ))
-            fig_bar.update_layout(
-                template="plotly_dark",
-                margin=dict(t=25, b=10, l=10, r=10),
-                height=220,
-                font=dict(family="Plus Jakarta Sans, sans-serif", size=11),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                yaxis=dict(title=f"Net Balance ({CURR})", gridcolor="rgba(255,255,255,0.05)")
+    if view == "Expenses":
+        rows = db.get_expenses_filtered(user_id=ACTIVE_ID, category=None if cat == "All categories" else cat,
+                                        start_date=s_iso, end_date=e_iso, search=search.strip() or None)
+        id_key = "exp_id"
+        cols = ["date", "description", "category", "payment_method", "notes", "amount"]
+        names = {"date": "Date", "description": "Description", "category": "Category",
+                 "payment_method": "Paid with", "notes": "Notes", "amount": "Amount"}
+    else:
+        rows = db.get_incomes_filtered(user_id=ACTIVE_ID, start_date=s_iso, end_date=e_iso, search=search.strip() or None)
+        id_key = "income_id"
+        cols = ["date", "description", "source", "amount"]
+        names = {"date": "Date", "description": "Description", "source": "Source", "amount": "Amount"}
+
+    if not rows:
+        with st.container(border=True):
+            empty_state("No matching transactions", "Try a different period or search.")
+        return
+
+    df = pd.DataFrame(rows)
+    show = df[cols].rename(columns=names)
+    show["Date"] = pd.to_datetime(show["Date"])
+    total = df["amount"].sum()
+    st.markdown(f"<div class='muted' style='margin:2px 0 6px'>{len(df)} {'transactions' if len(df) != 1 else 'transaction'} &middot; total <b style='color:var(--ink)'>{fmt(total)}</b> &middot; select a row to edit it</div>",
+                unsafe_allow_html=True)
+    event = st.dataframe(
+        show, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(show)),
+        on_select="rerun", selection_mode="single-row", key=f"ledger_{view}",
+        column_config={"Date": st.column_config.DateColumn("Date", format="DD MMM YYYY"), "Amount": money_col("Amount")},
+    )
+    c_dl, _ = st.columns([1, 4])
+    c_dl.download_button("Download CSV", data=df.to_csv(index=False).encode("utf-8"),
+                         file_name=f"{view.lower()}_{period.lower().replace(' ', '_')}.csv", mime="text/csv",
+                         icon=":material/download:")
+
+    sel = event.selection.rows if event and event.selection else []
+    if not sel:
+        return
+    rec = rows[sel[0]]
+    rid = rec[id_key]
+    with st.container(border=True):
+        section(f"Edit {'expense' if view == 'Expenses' else 'income'}", f"{nice_date(rec['date'])} · {rec['description'] or ''}")
+        with st.form(f"edit_{id_key}_{rid}"):
+            c1, c2, c3 = st.columns(3)
+            amt = c1.number_input(f"Amount ({CURR})", min_value=0.01, value=float(rec["amount"]), step=100.0, format="%.2f")
+            d = c3.date_input("Date", value=date.fromisoformat(rec["date"][:10]))
+            if view == "Expenses":
+                cats = db.EXPENSE_CATEGORIES if rec["category"] in db.EXPENSE_CATEGORIES else db.EXPENSE_CATEGORIES + [rec["category"]]
+                cat_v = c2.selectbox("Category", cats, index=cats.index(rec["category"]))
+                c4, c5, c6 = st.columns(3)
+                desc = c4.text_input("Description", value=rec["description"] or "")
+                methods = db.PAYMENT_METHODS if rec["payment_method"] in db.PAYMENT_METHODS else db.PAYMENT_METHODS + [rec["payment_method"] or "Other"]
+                meth = c5.selectbox("Paid with", methods, index=methods.index(rec["payment_method"] or "Other"))
+                notes = c6.text_input("Notes", value=rec["notes"] or "")
+            else:
+                srcs = db.INCOME_SOURCES if rec["source"] in db.INCOME_SOURCES else db.INCOME_SOURCES + [rec["source"]]
+                src_v = c2.selectbox("Source", srcs, index=srcs.index(rec["source"]))
+                desc = st.text_input("Description", value=rec["description"] or "")
+            b1, b2, _ = st.columns([1, 1, 3])
+            save = b1.form_submit_button("Save changes", type="primary", width="stretch")
+            delete = b2.form_submit_button("Delete", width="stretch")
+            confirm = st.checkbox("Yes, delete this record", key=f"confirm_del_{id_key}_{rid}")
+        if save:
+            if view == "Expenses":
+                db.update_expense(rid, amount=float(amt), category=cat_v, description=desc.strip(), date=d.isoformat(),
+                                  payment_method=meth, notes=notes.strip())
+            else:
+                db.update_income(rid, amount=float(amt), source=src_v, description=desc.strip(), date=d.isoformat())
+            flash("Changes saved")
+            st.rerun()
+        if delete:
+            if not confirm:
+                st.warning("Tick the confirmation box to delete this record.")
+            else:
+                (db.delete_expense if view == "Expenses" else db.delete_income)(rid)
+                flash("Record deleted", ":material/delete:")
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Page: Budgets
+# ---------------------------------------------------------------------------
+def page_budgets():
+    page_header("Budgets", "A monthly budget plus optional limits per category.")
+
+    months = sorted({m["month"] for m in db.get_monthly_spending(ACTIVE_ID)} | {cur_month}, reverse=True)[:12]
+    c_m, _ = st.columns([1, 3])
+    month = c_m.selectbox("Month", months, format_func=month_label, key="budget_month")
+    is_current = month == cur_month
+
+    bs = logic.get_budget_status(ACTIVE_ID, month)
+    cat_status = logic.get_category_budget_status(ACTIVE_ID, month)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        tile("Monthly budget", fmt(bs["budget"]) if bs["budget"] else "Not set",
+             f"{len([c for c in cat_status if c['has_budget']])} category limits")
+    with k2:
+        tile("Spent", fmt(bs["spent"]), f"{bs['pct_used']:.0f}% of budget" if bs["budget"] else "",
+             meter=(bs["spent"] / bs["budget"]) if bs["budget"] else None,
+             meter_color=charts.CRITICAL if bs["is_over_budget"] else charts.SERIES[0])
+    with k3:
+        if bs["budget"]:
+            tile("Over budget" if bs["is_over_budget"] else "Remaining", fmt(abs(bs["remaining"])),
+                 f"{fmt(bs['safe_daily_spend'])} a day for {bs['days_remaining']} days" if is_current and not bs["is_over_budget"] else "",
+                 tone="neg" if bs["is_over_budget"] else "")
+        else:
+            tile("Remaining", "—", "Set a monthly budget")
+    with k4:
+        if is_current:
+            proj_tone = "neg" if bs["budget"] and bs["projected_spend"] > bs["budget"] else ""
+            tile("Projected month-end", fmt(bs["projected_spend"]),
+                 "Rent counted once; day-to-day spending extrapolated", tone=proj_tone)
+        else:
+            tile("Month closed", fmt(bs["spent"]), "Final spending for the month")
+
+    st.write("")
+    left, right = st.columns([3, 2], gap="medium")
+    with left:
+        with st.container(border=True):
+            section("Spending by category", f"{month_label(month)}. Bars turn red once a category passes its limit.")
+            if cat_status:
+                plot(charts.category_vs_budget(cat_status, CURR, max_rows=12))
+            else:
+                empty_state("No spending recorded for this month", "")
+    with right:
+        with st.container(border=True):
+            section("Monthly budget")
+            with st.form("form_monthly_budget"):
+                nb = st.number_input(f"Amount ({CURR})", min_value=0.0, value=float(ACTIVE.get("monthly_budget") or 0),
+                                     step=1000.0, format="%.2f")
+                if st.form_submit_button("Save budget", width="stretch"):
+                    db.update_user(ACTIVE_ID, monthly_budget=float(nb))
+                    flash("Monthly budget updated")
+                    st.rerun()
+        with st.container(border=True):
+            section("Category limit", "Set or change the monthly limit for a category.")
+            existing = {c["category"]: c["budget"] for c in cat_status if c["has_budget"]}
+            with st.form("form_cat_limit"):
+                cat = st.selectbox("Category", db.EXPENSE_CATEGORIES)
+                lim = st.number_input(f"Monthly limit ({CURR})", min_value=0.0, value=5000.0, step=500.0, format="%.2f")
+                if st.form_submit_button("Save limit", width="stretch"):
+                    if lim <= 0:
+                        db.delete_category_budget(ACTIVE_ID, cat)
+                        flash(f"Removed the limit for {cat}")
+                    else:
+                        db.set_category_budget(ACTIVE_ID, cat, float(lim))
+                        flash(f"Limit for {cat} set to {fmt(lim)}")
+                    st.rerun()
+            if existing:
+                rc1, rc2 = st.columns([2, 1], vertical_alignment="bottom")
+                rm = rc1.selectbox("Remove a limit", list(existing), key="rm_limit")
+                if rc2.button("Remove", width="stretch"):
+                    db.delete_category_budget(ACTIVE_ID, rm)
+                    flash(f"Removed the limit for {rm}", ":material/delete:")
+                    st.rerun()
+
+    if cat_status:
+        with st.container(border=True):
+            section("Category detail")
+            df = pd.DataFrame(cat_status)
+            df["limit"] = df["budget"].where(df["has_budget"])
+            df["used"] = df["pct_used"]
+            st.dataframe(
+                df[["category", "spent", "limit", "remaining", "used"]], hide_index=True, width="stretch",
+                column_config={
+                    "category": "Category", "spent": money_col("Spent"), "limit": money_col("Limit"),
+                    "remaining": money_col("Remaining"),
+                    "used": st.column_config.ProgressColumn("Used", min_value=0, max_value=100, format="%.0f%%"),
+                },
             )
-            st.plotly_chart(fig_bar, width="stretch")
 
-        st.divider()
 
-        debts = logic.get_who_owes_whom(active_group_id)
-        st.markdown(f"##### Optimized Settlement Plan ({len(debts)} Direct Transfers Required)")
+# ---------------------------------------------------------------------------
+# Page: Reports
+# ---------------------------------------------------------------------------
+def page_reports():
+    page_header("Reports", "How your income, spending and savings have moved over time.")
 
-        if debts:
-            for idx, d in enumerate(debts):
-                with st.container(border=True):
-                    dc1, dc2, dc3 = st.columns([3, 2, 1], vertical_alignment="center")
-                    with dc1:
-                        st.markdown(f"""
-                            <div style="font-weight:700;">
-                                <span style="color:#EF4444;">{d['from_name']}</span>
-                                <span style="color:#64748B; margin: 0 6px;">&rarr;</span>
-                                <span style="color:#16A34A;">{d['to_name']}</span>
-                                <span style="font-family:'JetBrains Mono',monospace; color:#F8FAFC; margin-left:10px;">{fmt(d['amount'])}</span>
-                            </div>
-                        """, unsafe_allow_html=True)
-                    with dc2:
-                        st.caption(f"Clears balance obligation between parties")
-                    with dc3:
-                        if st.button("Settle Transfer", key=f"btn_quick_settle_{idx}", width="stretch", type="primary"):
-                            quick_settle_modal(
-                                d["from_user"],
-                                d["to_user"],
-                                d["amount"],
-                                f"Settlement payment ({d['from_name']} -> {d['to_name']})",
-                                active_group_id
-                            )
+    rng = st.segmented_control("Range", ["6 months", "12 months", "All time"], default="6 months", key="report_range") or "6 months"
+    spend = {r["month"]: r["total"] for r in db.get_monthly_spending(ACTIVE_ID)}
+    income = {r["month"]: r["total"] for r in db.get_monthly_income(ACTIVE_ID)}
+    all_months = sorted(set(spend) | set(income) | {cur_month})
+    first = all_months[0]
+    if rng != "All time":
+        n = 6 if rng == "6 months" else 12
+        first = max(first, db.month_start(today, n - 1).strftime("%Y-%m"))
+    # Continuous month index so gaps show as zero instead of disappearing
+    months, d = [], date.fromisoformat(first + "-01")
+    while d.strftime("%Y-%m") <= cur_month:
+        months.append(d.strftime("%Y-%m"))
+        d = db.month_start(d, -1)
+    merged = pd.DataFrame({"month": months,
+                           "Income": [income.get(m, 0.0) for m in months],
+                           "Expenses": [spend.get(m, 0.0) for m in months]})
 
-            try:
-                sankey_data = logic.get_sankey_debt_data(active_group_id, curr=CURR)
-            except Exception:
-                try:
-                    sankey_data = logic.get_sankey_debt_data(active_group_id)
-                except Exception:
-                    sankey_data = None
+    if not (merged["Income"].sum() or merged["Expenses"].sum()):
+        with st.container(border=True):
+            empty_state("No data yet", "Reports appear once you've recorded some transactions.")
+        return
 
-            if sankey_data:
-                with st.expander("Directional Debt Flow Graph (Sankey)", expanded=False):
-                    fig_sankey = go.Figure(data=[go.Sankey(
-                        node=dict(pad=15, thickness=18, line=dict(color="#0A0D14", width=0.5), label=sankey_data["nodes"], color="#2563EB"),
-                        link=dict(source=sankey_data["sources"], target=sankey_data["targets"], value=sankey_data["values"], label=sankey_data["labels"], color="rgba(37, 99, 235, 0.18)")
-                    )])
-                    fig_sankey.update_layout(template="plotly_dark", height=260, margin=dict(t=20, b=10, l=10, r=10), paper_bgcolor="rgba(0,0,0,0)")
-                    st.plotly_chart(fig_sankey, width="stretch")
-        else:
-            st.markdown("<span class='badge badge-green'>All accounts balanced & settled</span>", unsafe_allow_html=True)
+    # Averages exclude the current, unfinished month
+    closed = merged[merged["month"] < cur_month]
+    basis = closed if len(closed) else merged
+    avg_inc, avg_exp = basis["Income"].mean(), basis["Expenses"].mean()
+    avg_rate = ((basis["Income"] - basis["Expenses"]).sum() / basis["Income"].sum() * 100) if basis["Income"].sum() else 0
+    # Like-for-like: this month so far vs the same days of last month
+    prev_m = db.month_start(today, 1).strftime("%Y-%m")
+    this_so_far = sum(r["total"] for r in db.get_daily_spending(ACTIVE_ID, cur_month))
+    prev_same = sum(r["total"] for r in db.get_daily_spending(ACTIVE_ID, prev_m) if int(r["date"][8:10]) <= today.day)
 
-        # Past Settlement Audit Log
-        past_settlements = db.get_settlements(active_group_id)
-        if past_settlements:
-            with st.expander(f"Settlement Transaction Audit Trail ({len(past_settlements)} records)", expanded=False):
-                df_st = pd.DataFrame(past_settlements)
-                df_st_disp = df_st[["settlement_id", "date", "from_name", "to_name", "amount", "payment_method", "note"]].copy()
-                df_st_disp["amount"] = df_st_disp["amount"].apply(lambda x: fmt(x))
-                df_st_disp.rename(columns={"settlement_id": "ID", "date": "Date", "from_name": "Payer", "to_name": "Receiver", "amount": "Amount", "payment_method": "Instrument", "note": "Reference"}, inplace=True)
-                st.dataframe(df_st_disp, width="stretch", hide_index=True)
-
-# =========================================================================
-# TAB 5: ANALYTICS (TRENDS & PACING TELEMETRY)
-# =========================================================================
-with tabs[4]:
-    st.markdown("### Analytics & Multi-Month Telemetry")
-
-    mom = logic.get_month_over_month_metrics(active_user_id)
-    mom_c1, mom_c2, mom_c3 = st.columns(3)
-    with mom_c1:
-        exp_delta = f"{'+' if mom['expense_diff'] >= 0 else ''}{fmt(mom['expense_diff'])} ({mom['expense_change_pct']}%)"
-        st.metric("Expenses vs Previous Month", fmt(mom["current_expense"]), delta=exp_delta, delta_color="inverse")
-    with mom_c2:
-        inc_delta = f"{'+' if mom['income_diff'] >= 0 else ''}{fmt(mom['income_diff'])} ({mom['income_change_pct']}%)"
-        st.metric("Inflows vs Previous Month", fmt(mom["current_income"]), delta=inc_delta, delta_color="normal")
-    with mom_c3:
-        st.metric("Established Monthly Cap", fmt(active_user.get("monthly_budget", 0)))
-
-    st.divider()
-
-    st.markdown("##### Category Budget Allocator")
-    cat_budgets = logic.get_category_budget_status(active_user_id, cur_month)
-    cb_col_left, cb_col_right = st.columns([1, 1])
-    with cb_col_left:
-        with st.form("form_set_cat_budget"):
-            st.markdown("**Establish Spending Cap**")
-            set_cat = st.selectbox("Category", [
-                "Food & Dining", "Housing & Rent", "Groceries", "Utilities",
-                "Transportation", "Entertainment", "Health & Medical", "Shopping", "Travel", "Other"
-            ])
-            set_limit = st.number_input(f"Monthly Cap ({CURR})", min_value=10.0, value=300.0, step=25.0)
-            if st.form_submit_button("Save Cap", width="stretch"):
-                db.set_category_budget(active_user_id, set_cat, float(set_limit))
-                st.success(f"Cap of {fmt(set_limit)} set for {set_cat}")
-                st.rerun()
-
-    with cb_col_right:
-        st.markdown("**Active Category Caps**")
-        if cat_budgets:
-            df_cb = pd.DataFrame(cat_budgets)
-            df_cb_disp = df_cb[["category", "budget", "spent", "remaining", "pct_used"]].copy()
-            df_cb_disp["budget"] = df_cb_disp["budget"].apply(lambda x: fmt(x) if x > 0 else "None")
-            df_cb_disp["spent"] = df_cb_disp["spent"].apply(lambda x: fmt(x))
-            df_cb_disp["remaining"] = df_cb_disp["remaining"].apply(lambda x: fmt(x) if x is not None else "N/A")
-            df_cb_disp["pct_used"] = df_cb_disp["pct_used"].apply(lambda x: f"{x}%" if x is not None else "N/A")
-            df_cb_disp.rename(columns={"category": "Category", "budget": "Limit", "spent": "Spent", "remaining": "Remaining", "pct_used": "Utilized"}, inplace=True)
-            st.dataframe(df_cb_disp, width="stretch", hide_index=True)
-        else:
-            st.caption("No category allocations active.")
-
-    st.divider()
-
-    st.markdown("##### Multi-Month Revenue & Expenditure Pacing")
-    m_spend = db.get_monthly_spending(active_user_id)
-    m_income = db.get_monthly_income(active_user_id)
-
-    if m_spend or m_income:
-        df_ms = pd.DataFrame(m_spend) if m_spend else pd.DataFrame(columns=["month", "total"])
-        df_mi = pd.DataFrame(m_income) if m_income else pd.DataFrame(columns=["month", "total"])
-        df_ms.rename(columns={"total": "Expenses"}, inplace=True)
-        df_mi.rename(columns={"total": "Income"}, inplace=True)
-        merged_trends = pd.merge(df_ms, df_mi, on="month", how="outer").fillna(0).sort_values("month")
-
-        fig_trend = go.Figure()
-        fig_trend.add_trace(go.Bar(x=merged_trends["month"], y=merged_trends["Expenses"], name="Expenditure", marker_color="#DC2626"))
-        fig_trend.add_trace(go.Bar(x=merged_trends["month"], y=merged_trends["Income"], name="Inflow", marker_color="#16A34A"))
-        fig_trend.update_layout(
-            template="plotly_dark",
-            barmode="group",
-            height=280,
-            margin=dict(t=20, b=20, l=10, r=10),
-            yaxis_title=f"Amount ({CURR})",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            yaxis=dict(gridcolor="rgba(255,255,255,0.05)")
-        )
-        st.plotly_chart(fig_trend, width="stretch")
-    else:
-        st.caption("Multi-month data will appear as records accumulate across dates.")
-
-# =========================================================================
-# TAB 6: EMAIL REMINDERS (ACCOUNTS RECEIVABLE ENGINE)
-# =========================================================================
-with tabs[5]:
-    st.markdown("### Accounts Receivable & Email Statements")
-    st.caption("Automated generation and dispatch of formal debt settlement statements via SMTP mail.")
-
-    unpaid_splits_all = logic.get_unpaid_splits(active_group_id)
-
-    ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 2], vertical_alignment="center")
-    with ctrl1:
-        overdue_days_setting = st.slider("Overdue Threshold (Days)", min_value=1, max_value=30, value=3)
-    with ctrl2:
-        is_dry_run_mode = st.toggle("Simulation Mode (Dry-Run)", value=True, help="Simulate email dispatch safely without transmitting live emails.")
-    with ctrl3:
-        mode_badge = "<span class='badge badge-amber'>Simulation Mode</span>" if is_dry_run_mode else "<span class='badge badge-green'>Live SMTP Mode</span>"
-        st.markdown(f"<div style='text-align:right;'>{mode_badge}</div>", unsafe_allow_html=True)
-
-    cutoff_date = (datetime.now() - timedelta(days=overdue_days_setting)).strftime("%Y-%m-%d")
-    overdue_splits = [s for s in unpaid_splits_all if s["date"] <= cutoff_date]
-    total_overdue_amt = sum(s["amount_owed"] for s in overdue_splits)
-    ready_email_count = sum(1 for s in overdue_splits if s.get("debtor_email"))
-
-    # Reminder KPIs Bar
-    rk1, rk2, rk3, rk4 = st.columns(4)
-    with rk1:
-        st.markdown(f"""
-            <div class="metric-strip-card">
-                <div class="metric-label-txt">Overdue Items</div>
-                <div class="metric-val-txt">{len(overdue_splits)}</div>
-                <div class="metric-sub-txt">&gt; {overdue_days_setting} days outstanding</div>
-            </div>
-        """, unsafe_allow_html=True)
-    with rk2:
-        st.markdown(f"""
-            <div class="metric-strip-card">
-                <div class="metric-label-txt">Outstanding Balance</div>
-                <div class="metric-val-txt txt-rose">{fmt(total_overdue_amt)}</div>
-                <div class="metric-sub-txt">Receivable volume</div>
-            </div>
-        """, unsafe_allow_html=True)
-    with rk3:
-        st.markdown(f"""
-            <div class="metric-strip-card">
-                <div class="metric-label-txt">Deliverable Contacts</div>
-                <div class="metric-val-txt txt-sky">{ready_email_count} / {len(overdue_splits)}</div>
-                <div class="metric-sub-txt">Valid email addresses</div>
-            </div>
-        """, unsafe_allow_html=True)
-    with rk4:
-        st.markdown(f"""
-            <div class="metric-strip-card">
-                <div class="metric-label-txt">Transmission Protocol</div>
-                <div class="metric-val-txt">SMTP / TLS</div>
-                <div class="metric-sub-txt">Multipart HTML + Plain text</div>
-            </div>
-        """, unsafe_allow_html=True)
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        tile("Average monthly income", fmt(avg_inc, 0), f"Over {len(basis)} completed month(s)")
+    with k2:
+        tile("Average monthly spending", fmt(avg_exp, 0), f"Over {len(basis)} completed month(s)")
+    with k3:
+        tile("Savings rate", f"{avg_rate:.0f}%", "Share of income kept", tone="pos" if avg_rate > 0 else ("neg" if avg_rate < 0 else ""))
+    with k4:
+        diff = this_so_far - prev_same
+        pct = f" ({diff / prev_same * 100:+.0f}%)" if prev_same else ""
+        prev_abbr = datetime.strptime(prev_m, "%Y-%m").strftime("%b")
+        tile("Spending vs last month", fmt_signed(diff, 0) + pct,
+             f"{today:%b} 1–{today.day} vs {prev_abbr} 1–{today.day}",
+             tone="neg" if diff > 0 else ("pos" if diff < 0 else ""))
 
     st.write("")
+    left, right = st.columns(2, gap="medium")
+    with left:
+        with st.container(border=True):
+            section("Income and spending", "Monthly totals.")
+            plot(charts.income_vs_expenses(merged, CURR))
+    with right:
+        with st.container(border=True):
+            section("Net savings", "Income minus spending each month.")
+            plot(charts.net_savings(merged, CURR))
 
-    st.markdown(f"##### Outstanding Receivables Awaiting Settlement ({len(overdue_splits)})")
+    with st.container(border=True):
+        section("Spending mix", "Your five largest categories; everything else is grouped as Other.")
+        cat_rows = [r for r in db.get_monthly_category_spending(ACTIVE_ID) if r["month"] >= months[0]]
+        if cat_rows:
+            plot(charts.category_trend(cat_rows, CURR))
+        with st.expander("Table view"):
+            table = merged.copy()
+            table["Net"] = table["Income"] - table["Expenses"]
+            table["month"] = table["month"].map(month_label)
+            st.dataframe(table.rename(columns={"month": "Month"}), hide_index=True, width="stretch",
+                         column_config={c: money_col(c) for c in ["Income", "Expenses", "Net"]})
+            if cat_rows:
+                pivot = pd.DataFrame(cat_rows).pivot_table(index="category", columns="month", values="total",
+                                                           aggfunc="sum", fill_value=0)
+                pivot.columns = [datetime.strptime(c, "%Y-%m").strftime("%b %y") for c in pivot.columns]
+                st.dataframe(pivot, width="stretch",
+                             column_config={c: money_col(c) for c in pivot.columns})
 
-    if overdue_splits:
-        for idx, s in enumerate(overdue_splits):
+
+# ---------------------------------------------------------------------------
+# Page: Circles
+# ---------------------------------------------------------------------------
+def _new_circle_form(key):
+    with st.form(key, clear_on_submit=True):
+        name = st.text_input("Circle name", placeholder="e.g. Flat 302, Ladakh trip")
+        include_me = st.checkbox(f"Add {FIRST_NAME} as a member", value=True)
+        if st.form_submit_button("Create circle", type="primary", width="stretch"):
+            try:
+                gid = db.create_group(name)
+                if include_me:
+                    db.add_member_to_group(gid, ACTIVE_ID)
+                st.session_state["circle_id"] = gid
+                flash(f"Created {name.strip()}")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+
+def page_circles():
+    page_header("Circles", "Shared expenses with flatmates, friends and trips.")
+    if not groups:
+        with st.container(border=True):
+            empty_state("No circles yet", "Create a circle to start splitting bills.")
+            _, mid, _ = st.columns([1, 2, 1])
+            with mid:
+                _new_circle_form("first_circle")
+        return
+
+    gids = [g["group_id"] for g in groups]
+    mine = [g["group_id"] for g in db.get_user_groups(ACTIVE_ID)]
+    ensure_choice("circle_id", gids, default=mine[0] if mine else None)
+    c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+    gid = c1.selectbox("Circle", gids, format_func=lambda i: group_map[i]["group_name"], key="circle_id")
+    with c2:
+        with st.popover("New circle", icon=":material/add:", width="stretch"):
+            _new_circle_form("new_circle")
+
+    members = db.get_group_members(gid)
+    member_ids = [m["user_id"] for m in members]
+    bills = db.get_group_shared_expenses(gid)
+    balances = logic.compute_balances(gid)
+    open_items = logic.get_unpaid_splits(gid)
+    my_bal = balances.get(ACTIVE_ID, 0.0)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        tile("Total spent", fmt(sum(b["amount"] for b in bills)), f"{len(bills)} bill(s)")
+    with k2:
+        tile("Members", str(len(members)), ", ".join(esc(m["name"].split()[0]) for m in members[:4])
+             + ("…" if len(members) > 4 else ""))
+    with k3:
+        if ACTIVE_ID not in member_ids:
+            tile("Your balance", "—", f"{esc(FIRST_NAME)} isn't a member")
+        elif my_bal > 0.01:
+            tile("Your balance", fmt(my_bal), "You're owed", tone="pos")
+        elif my_bal < -0.01:
+            tile("Your balance", fmt(-my_bal), "You owe", tone="neg")
+        else:
+            tile("Your balance", fmt(0), "Settled up")
+    with k4:
+        tile("Open items", str(len(open_items)), f"{fmt(sum(s['amount_owed'] for s in open_items))} in unpaid shares")
+
+    st.write("")
+    t_bills, t_add, t_members = st.tabs(["Bills", "Add a bill", "Members & settings"])
+
+    with t_bills:
+        if not bills:
             with st.container(border=True):
-                r_c1, r_c2, r_c3, r_c4 = st.columns([4, 2, 2, 2], vertical_alignment="center")
-                
-                with r_c1:
-                    debtor_mail = s.get("debtor_email")
-                    mail_badge = f"<span class='badge badge-blue' style='font-family:monospace;'>{debtor_mail}</span>" if debtor_mail else "<span class='badge badge-amber'>Missing Email</span>"
-                    st.markdown(f"""
-                        <div style="font-weight:700; color:#F8FAFC;">
-                            {s['debtor_name']} owes <span style="font-family:'JetBrains Mono',monospace; color:#EF4444;">{fmt(s['amount_owed'])}</span> to {s['payer_name']}
-                            &bull; {mail_badge}
-                        </div>
-                    """, unsafe_allow_html=True)
-                    st.caption(f"Bill: '{s['description']}' ({s['date']}) &bull; Circle: {s.get('group_name', 'General')}")
-
-                with r_c2:
-                    if st.button("Preview Statement", key=f"btn_preview_mail_{s['split_id']}", width="stretch"):
-                        preview_email_modal(s)
-
-                with r_c3:
-                    if st.button("Send Reminder", key=f"btn_send_mail_{s['split_id']}", width="stretch", type="primary", disabled=not s.get("debtor_email")):
-                        res = reminders.send_single_split_reminder(
-                            s,
-                            is_dry_run=is_dry_run_mode,
-                            smtp_config=st.session_state["smtp_config"],
-                            curr=CURR
-                        )
-                        if res["success"]:
-                            st.toast(res['msg'])
-                            st.success(res['msg'])
-                        else:
-                            st.error(res['msg'])
-
-                with r_c4:
-                    if st.button("Mark Paid", key=f"nudge_mark_paid_{s['split_id']}", width="stretch"):
-                        db.mark_split_paid(s["split_id"], True)
-                        st.success("Split marked paid.")
-                        st.rerun()
-
-        st.divider()
-        st.markdown("##### Batch Automated Dispatcher")
-        
-        col_disp1, col_disp2 = st.columns([3, 1], vertical_alignment="center")
-        with col_disp1:
-            st.caption(f"Trigger payment statement dispatch to all {ready_email_count} contactable debtors.")
-        with col_disp2:
-            if st.button("Dispatch All Reminders", type="primary", width="stretch"):
-                results = reminders.send_gentle_reminders(
-                    group_id=active_group_id,
-                    overdue_days=overdue_days_setting,
-                    is_dry_run=is_dry_run_mode,
-                    smtp_config=st.session_state["smtp_config"],
-                    curr=CURR
-                )
-                st.session_state["last_reminder_results"] = results
-                st.success(results["message"])
-
-        if st.session_state.get("last_reminder_results"):
-            last_res = st.session_state["last_reminder_results"]
+                empty_state("No bills yet", "Add the first bill in the “Add a bill” tab.")
+        show_all = len(bills) <= 15 or st.toggle(f"Show all {len(bills)} bills", key=f"all_bills_{gid}")
+        for b in (bills if show_all else bills[:15]):
+            splits = db.get_splits_for_expense(b["shared_id"])
+            owing = [s for s in splits if s["user_id"] != b["payer_id"]]
+            paid_n = sum(1 for s in owing if s["is_paid"])
             with st.container(border=True):
-                st.markdown("###### Dispatch Audit Log")
-                for sent_item in last_res.get("sent", []):
-                    icon = "Delivered" if sent_item["success"] else "Failed"
-                    st.caption(f"[{icon}] To {sent_item['debtor']} ({sent_item['to']}): {sent_item['msg']}")
+                h1, h2 = st.columns([4, 1], vertical_alignment="center")
+                with h1:
+                    status = chip("Settled", "pos") if owing and paid_n == len(owing) else chip(f"{paid_n}/{len(owing)} paid")
+                    st.markdown(f"<div class='row-main'>{esc(b['description'])} &nbsp;{status}</div>"
+                                f"<div class='row-meta'>{nice_date(b['date'])} &middot; paid by {esc(b['payer_name'])} &middot; {esc(b.get('category') or 'General')}</div>",
+                                unsafe_allow_html=True)
+                with h2:
+                    st.markdown(f"<div class='row-amt' style='text-align:right;font-size:1rem'>{fmt(b['amount'])}</div>",
+                                unsafe_allow_html=True)
+                with st.expander("Split details"):
+                    for s in splits:
+                        r1, r2, r3 = st.columns([3, 1.2, 1.2], vertical_alignment="center")
+                        r1.markdown(f"<div class='row-main' style='font-weight:400'>{esc(s['user_name'])}</div>", unsafe_allow_html=True)
+                        r2.markdown(f"<div class='row-amt'>{fmt(s['amount_owed'])}</div>", unsafe_allow_html=True)
+                        with r3:
+                            if s["user_id"] == b["payer_id"]:
+                                st.markdown(chip("Paid the bill", "blue"), unsafe_allow_html=True)
+                            elif s["is_paid"]:
+                                if st.button("Mark unpaid", key=f"unpaid_{s['split_id']}", type="tertiary"):
+                                    db.mark_split_paid(s["split_id"], False)
+                                    st.rerun()
+                            else:
+                                if st.button("Mark paid", key=f"paid_{s['split_id']}"):
+                                    db.mark_split_paid(s["split_id"], True)
+                                    flash(f"{s['user_name']}'s share marked as paid")
+                                    st.rerun()
+                    st.caption("Mark a share as paid when it was paid back directly for this bill. "
+                               "For lump-sum payments use Settle up instead (don't do both for the same money).")
+                    with st.popover("Delete bill", icon=":material/delete:"):
+                        st.write(f"Delete **{b['description']}** and all its splits?")
+                        if st.button("Delete", type="primary", key=f"del_bill_{b['shared_id']}"):
+                            db.delete_shared_expense(b["shared_id"])
+                            flash("Bill deleted", ":material/delete:")
+                            st.rerun()
 
-    else:
-        st.markdown("<span class='badge badge-green'>No overdue splits beyond threshold.</span>", unsafe_allow_html=True)
+    with t_add:
+        if not members:
+            with st.container(border=True):
+                empty_state("This circle has no members", "Add members in the “Members & settings” tab first.")
+        else:
+            _bill_builder(gid, members)
 
-    # SMTP Configuration
-    st.divider()
-    with st.expander("SMTP Delivery Settings & Connection Verification", expanded=False):
-        st.caption("Configure standard SMTP credentials (TLS / SSL) for outbound financial notification delivery.")
+    with t_members:
+        _circle_settings(gid, members, balances)
 
-        with st.form("form_smtp_config"):
-            c_smtp1, c_smtp2, c_smtp3 = st.columns(3)
-            with c_smtp1:
-                cfg_host = st.text_input("SMTP Host", value=st.session_state["smtp_config"]["host"])
-                cfg_port = st.number_input("SMTP Port", value=int(st.session_state["smtp_config"]["port"]), min_value=1, max_value=65535)
-            with c_smtp2:
-                cfg_user = st.text_input("SMTP Username / Email", value=st.session_state["smtp_config"]["user"], placeholder="user@domain.com")
-                cfg_pass = st.text_input("SMTP App Password", value=st.session_state["smtp_config"]["pass"], type="password", placeholder="Password / Token")
-            with c_smtp3:
-                cfg_from = st.text_input("Sender Address", value=st.session_state["smtp_config"]["from_email"], placeholder="noreply@domain.com")
-                test_recipient = st.text_input("Test Recipient", value=active_user.get("email") or "", placeholder="recipient@domain.com")
 
-            c_btn_save, c_btn_test = st.columns([1, 1])
-            with c_btn_save:
-                save_smtp = st.form_submit_button("Save Credentials", type="secondary", width="stretch")
-            with c_btn_test:
-                test_smtp = st.form_submit_button("Test SMTP Authentication", type="primary", width="stretch")
+def _bill_builder(gid, members):
+    name = {m["user_id"]: m["name"] for m in members}
+    ids = list(name)
+    with st.container(border=True):
+        c1, c2, c3 = st.columns(3)
+        desc = c1.text_input("Description", placeholder="e.g. Electricity bill", key=f"bb_desc_{gid}")
+        total = c2.number_input(f"Total ({CURR})", min_value=0.0, value=None, step=100.0, format="%.2f",
+                                placeholder="0.00", key=f"bb_total_{gid}")
+        d = c3.date_input("Date", value=today, max_value=today, key=f"bb_date_{gid}")
+        c4, c5 = st.columns(2)
+        payer = c4.selectbox("Paid by", ids, format_func=name.get,
+                             index=ids.index(ACTIVE_ID) if ACTIVE_ID in ids else 0, key=f"bb_payer_{gid}")
+        category = c5.selectbox("Category", db.SHARED_CATEGORIES, key=f"bb_cat_{gid}")
+        parts = st.multiselect("Split between", ids, default=ids, format_func=name.get, key=f"bb_parts_{gid}")
+        mode = st.segmented_control("Split", ["Equally", "Exact amounts", "Percentages", "Shares"],
+                                    default="Equally", key=f"bb_mode_{gid}") or "Equally"
+        total = float(total or 0)
 
-            if save_smtp:
-                st.session_state["smtp_config"] = {
-                    "host": cfg_host.strip(),
-                    "port": int(cfg_port),
-                    "user": cfg_user.strip(),
-                    "pass": cfg_pass.strip(),
-                    "from_email": cfg_from.strip() or cfg_user.strip()
-                }
-                st.success("SMTP configuration saved into active session.")
-
-            if test_smtp:
-                temp_cfg = {
-                    "host": cfg_host.strip(),
-                    "port": int(cfg_port),
-                    "user": cfg_user.strip(),
-                    "pass": cfg_pass.strip(),
-                    "from_email": cfg_from.strip() or cfg_user.strip()
-                }
-                st.session_state["smtp_config"] = temp_cfg
-                ok, msg = reminders.test_smtp_connection(temp_cfg, test_to_email=test_recipient.strip() if test_recipient.strip() else None)
-                if ok:
-                    st.success(msg)
+        splits, problem = None, None
+        if not parts:
+            problem = "Choose at least one person to split with."
+        elif total <= 0:
+            problem = "Enter the bill total."
+        if parts:
+            cols = st.columns(min(4, len(parts)))
+            if mode == "Equally":
+                if total > 0:
+                    splits = dict(zip(parts, db.allocate_amounts(total, [1] * len(parts))))
+                    st.markdown(f"<div class='muted'>{fmt(total / len(parts))} each</div>", unsafe_allow_html=True)
+            elif mode == "Exact amounts":
+                vals = {}
+                for i, uid in enumerate(parts):
+                    vals[uid] = cols[i % len(cols)].number_input(name[uid], min_value=0.0, value=0.0, step=50.0,
+                                                                 format="%.2f", key=f"bb_ex_{gid}_{uid}")
+                left = round(total - sum(vals.values()), 2)
+                if abs(left) > 0.009:
+                    problem = problem or (f"{fmt(left)} left to assign." if left > 0 else f"Assigned {fmt(-left)} more than the total.")
                 else:
-                    st.error(msg)
-
-    # Background Daily Automation (Cron)
-    with st.expander("Headless Cron Automation Specification", expanded=False):
-        st.markdown(f"""
-            Execute daily headless reminder sweeps via server cron:
-            ```bash
-            # Daily execution at 09:00 UTC
-            0 9 * * * cd /home/tanishagrawal/BudgetApp && /home/tanishagrawal/.local/bin/python3.11 reminders.py --live >> reminders.log 2>&1
-            ```
-            **Required Environment Variables:**
-            ```bash
-            export SMTP_HOST="smtp.gmail.com"
-            export SMTP_PORT="587"
-            export SMTP_USER="your-email@gmail.com"
-            export SMTP_PASS="your-app-password"
-            export FROM_EMAIL="your-email@gmail.com"
-            ```
-        """)
-
-# =========================================================================
-# TAB 7: DATA & EXPORT
-# =========================================================================
-with tabs[6]:
-    st.markdown("### Ledger Data Records & CSV Export")
-    st.caption("Generate immutable CSV snapshots of expenditure, revenue, and settlement ledgers.")
-
-    exp_c1, exp_c2, exp_c3 = st.columns(3)
-    
-    with exp_c1:
-        with st.container(border=True):
-            st.markdown("##### Expenditures Ledger")
-            all_e = db.get_all_expenses()
-            st.caption(f"Volume: **{len(all_e)} records**")
-            if all_e:
-                csv_exp = pd.DataFrame(all_e).to_csv(index=False).encode('utf-8')
-                st.download_button("Export CSV", data=csv_exp, file_name=f"expenditures_{cur_month}.csv", mime="text/csv", width="stretch")
+                    splits = vals
+            elif mode == "Percentages":
+                vals = {}
+                default = round(100 / len(parts), 2)
+                for i, uid in enumerate(parts):
+                    vals[uid] = cols[i % len(cols)].number_input(f"{name[uid]} (%)", min_value=0.0, max_value=100.0,
+                                                                 value=default, step=5.0, key=f"bb_pct_{gid}_{uid}_{len(parts)}")
+                pct_total = round(sum(vals.values()), 2)
+                if abs(pct_total - 100) > 0.05:
+                    problem = problem or f"Percentages add up to {pct_total:g}%, not 100%."
+                elif total > 0:
+                    splits = dict(zip(vals, db.allocate_amounts(total, list(vals.values()))))
             else:
-                st.caption("No records available.")
+                vals = {}
+                for i, uid in enumerate(parts):
+                    vals[uid] = cols[i % len(cols)].number_input(f"{name[uid]} (shares)", min_value=0, value=1, step=1,
+                                                                 key=f"bb_sh_{gid}_{uid}")
+                if sum(vals.values()) <= 0:
+                    problem = problem or "At least one person needs a share."
+                elif total > 0:
+                    splits = dict(zip(vals, db.allocate_amounts(total, list(vals.values()))))
 
-    with exp_c2:
+        if splits and mode != "Equally":
+            st.markdown("<div class='muted'>" + " &middot; ".join(f"{esc(name[u])} {fmt(v)}" for u, v in splits.items())
+                        + "</div>", unsafe_allow_html=True)
+        if problem and (total > 0 or not parts):
+            st.markdown(f"<div class='muted tone-warn'>{esc(problem)}</div>", unsafe_allow_html=True)
+
+        if st.button("Add bill", type="primary", disabled=bool(problem) or not splits, key=f"bb_submit_{gid}"):
+            try:
+                db.add_shared_expense(gid, payer, total, desc.strip() or "Shared bill", d.isoformat(),
+                                      custom_splits={u: v for u, v in splits.items() if v > 0}, category=category)
+                for k in [f"bb_desc_{gid}", f"bb_total_{gid}"]:
+                    st.session_state.pop(k, None)
+                flash(f"Added {desc.strip() or 'bill'} for {fmt(total)}")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+
+def _circle_settings(gid, members, balances):
+    left, right = st.columns([3, 2], gap="medium")
+    with left:
         with st.container(border=True):
-            st.markdown("##### Inflow Revenue Ledger")
-            all_inc = db.get_user_incomes()
-            st.caption(f"Volume: **{len(all_inc)} records**")
-            if all_inc:
-                csv_inc = pd.DataFrame(all_inc).to_csv(index=False).encode('utf-8')
-                st.download_button("Export CSV", data=csv_inc, file_name=f"inflows_{cur_month}.csv", mime="text/csv", width="stretch")
-            else:
-                st.caption("No records available.")
-
-    with exp_c3:
+            section("Members", "Positive balances are owed money; negative balances owe money.")
+            if not members:
+                empty_state("No members yet", "")
+            for m in members:
+                bal = balances.get(m["user_id"], 0.0)
+                tone = "pos" if bal > 0.01 else ("neg" if bal < -0.01 else "")
+                st.markdown(f"<div class='row'><div><div class='row-main'>{esc(m['name'])}</div>"
+                            f"<div class='row-meta'>{esc(m.get('email') or 'No email')}</div></div>"
+                            f"<div class='row-amt tone-{tone}'>{fmt_signed(bal) if tone else 'Settled'}</div></div>",
+                            unsafe_allow_html=True)
+    with right:
         with st.container(border=True):
-            st.markdown("##### Settlement Audit Ledger")
-            all_settle = db.get_settlements()
-            st.caption(f"Volume: **{len(all_settle)} records**")
-            if all_settle:
-                csv_stl = pd.DataFrame(all_settle).to_csv(index=False).encode('utf-8')
-                st.download_button("Export CSV", data=csv_stl, file_name=f"settlements_{cur_month}.csv", mime="text/csv", width="stretch")
+            section("Add or remove members")
+            member_ids = [m["user_id"] for m in members]
+            addable = [u["user_id"] for u in users if u["user_id"] not in member_ids]
+            if addable:
+                a1, a2 = st.columns([2, 1], vertical_alignment="bottom")
+                to_add = a1.selectbox("Add", addable, format_func=lambda i: user_map[i]["name"], key=f"add_m_{gid}")
+                if a2.button("Add", key=f"add_m_btn_{gid}", width="stretch"):
+                    db.add_member_to_group(gid, to_add)
+                    flash(f"Added {user_map[to_add]['name']}")
+                    st.rerun()
             else:
-                st.caption("No records available.")
+                st.markdown("<div class='muted'>Everyone is already a member. Add new people in Settings.</div>",
+                            unsafe_allow_html=True)
+            if members:
+                r1, r2 = st.columns([2, 1], vertical_alignment="bottom")
+                to_rm = r1.selectbox("Remove", member_ids, format_func=lambda i: user_map[i]["name"], key=f"rm_m_{gid}")
+                if r2.button("Remove", key=f"rm_m_btn_{gid}", width="stretch"):
+                    if abs(balances.get(to_rm, 0.0)) > 0.01:
+                        st.error(f"{user_map[to_rm]['name']} still has an open balance in this circle. Settle it first.")
+                    else:
+                        db.remove_member_from_group(gid, to_rm)
+                        flash(f"Removed {user_map[to_rm]['name']}", ":material/person_remove:")
+                        st.rerun()
+        with st.container(border=True):
+            section("Circle settings")
+            with st.form(f"rename_{gid}"):
+                new_name = st.text_input("Name", value=group_map[gid]["group_name"])
+                if st.form_submit_button("Rename", width="stretch"):
+                    try:
+                        db.rename_group(gid, new_name)
+                        flash("Circle renamed")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+            with st.popover("Delete circle", icon=":material/delete:", width="stretch"):
+                st.write("This permanently deletes the circle, its bills and its splits.")
+                ok = st.checkbox("I understand", key=f"del_c_ok_{gid}")
+                if st.button("Delete circle", type="primary", disabled=not ok, key=f"del_c_{gid}"):
+                    db.delete_group(gid)
+                    st.session_state.pop("circle_id", None)
+                    flash("Circle deleted", ":material/delete:")
+                    st.rerun()
 
-# Institutional Footer
-st.divider()
-st.markdown("""
-    <div style="display:flex; justify-content:space-between; align-items:center; color:#64748B; font-size:0.74rem; padding:6px 0;">
-        <div>Smart Budgeter &bull; Institutional Financial Command</div>
-        <div>Python &bull; SQLite &bull; Plotly &bull; Streamlit</div>
-    </div>
-""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Page: Settle up
+# ---------------------------------------------------------------------------
+def page_settle():
+    page_header("Settle up", "Who owes whom, the fewest payments that clear it, and payments recorded so far.")
+
+    scope_opts = [0] + [g["group_id"] for g in groups]
+    ensure_choice("settle_scope", scope_opts)
+    c_s, _ = st.columns([1, 2])
+    scope = c_s.selectbox("Circle", scope_opts, format_func=lambda i: "All circles" if i == 0 else group_map[i]["group_name"],
+                          key="settle_scope")
+    gid = scope or None
+
+    plan = logic.get_settlement_plan(gid)
+    bal_details = logic.compute_balances_detailed(gid)
+    i_owe = sum(t["amount"] for t in plan if t["from_user"] == ACTIVE_ID)
+    owed_me = sum(t["amount"] for t in plan if t["to_user"] == ACTIVE_ID)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        tile("You owe", fmt(i_owe), f"{sum(1 for t in plan if t['from_user'] == ACTIVE_ID)} payment(s) to make",
+             tone="neg" if i_owe else "")
+    with k2:
+        tile("You're owed", fmt(owed_me), f"{sum(1 for t in plan if t['to_user'] == ACTIVE_ID)} payment(s) to receive",
+             tone="pos" if owed_me else "")
+    with k3:
+        tile("Payments needed", str(len(plan)), "To settle everyone in scope")
+    with k4:
+        tile("Outstanding", fmt(sum(t["amount"] for t in plan)), "Total still to be paid")
+
+    st.write("")
+    left, right = st.columns([3, 2], gap="medium")
+    with left:
+        with st.container(border=True):
+            section("Suggested payments", "Debts are simplified within each circle to the fewest transfers.")
+            if not plan:
+                empty_state("Everyone is settled up", "")
+            for i, t in enumerate(plan):
+                mine = ACTIVE_ID in (t["from_user"], t["to_user"])
+                c1, c2, c3 = st.columns([3, 1.2, 1.1], vertical_alignment="center")
+                c1.markdown(f"<div class='row-main'>{esc(t['from_name'])} &rarr; {esc(t['to_name'])}"
+                            f"{' &nbsp;' + chip('You', 'blue') if mine else ''}</div>"
+                            f"<div class='row-meta'>{esc(t['group_name'])}</div>", unsafe_allow_html=True)
+                c2.markdown(f"<div class='row-amt' style='text-align:right'>{fmt(t['amount'])}</div>", unsafe_allow_html=True)
+                if c3.button("Record", key=f"settle_{i}", width="stretch", type="primary" if mine else "secondary"):
+                    record_payment_dialog(t["from_user"], t["to_user"], t["amount"], t["group_id"],
+                                          f"{t['group_name']} settle-up")
+    with right:
+        with st.container(border=True):
+            section("Net balances", "Blue is owed money, red owes money.")
+            if bal_details:
+                plot(charts.net_balances(bal_details, CURR))
+            else:
+                empty_state("No balances yet", "")
+
+    if plan:
+        with st.container(border=True):
+            section("Payment flow", "Width shows how much each person pays.")
+            plot(charts.debt_flow(plan, CURR))
+
+    history = db.get_settlements(gid)
+    with st.container(border=True):
+        section("Payment history", "Select a row to delete a payment recorded by mistake.")
+        if not history:
+            empty_state("No payments recorded yet", "")
+            return
+        df = pd.DataFrame(history)
+        show = pd.DataFrame({
+            "Date": pd.to_datetime(df["date"].str[:10]), "From": df["from_name"], "To": df["to_name"],
+            "Amount": df["amount"], "Method": df["payment_method"], "Circle": df["group_name"].fillna("—"),
+            "Note": df["note"].fillna(""),
+        })
+        ev = st.dataframe(show, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
+                          key=f"settle_hist_{scope}", height=min(360, 38 + 35 * len(show)),
+                          column_config={"Date": st.column_config.DateColumn(format="DD MMM YYYY"), "Amount": money_col("Amount")})
+        sel = ev.selection.rows if ev and ev.selection else []
+        if sel:
+            rec = history[sel[0]]
+            d1, d2 = st.columns([3, 1], vertical_alignment="center")
+            d1.markdown(f"<div class='muted'>Selected: {esc(rec['from_name'])} &rarr; {esc(rec['to_name'])}, {fmt(rec['amount'])} on {nice_date(rec['date'])}</div>",
+                        unsafe_allow_html=True)
+            if d2.button("Delete payment", key=f"del_settle_{rec['settlement_id']}", width="stretch"):
+                db.delete_settlement(rec["settlement_id"])
+                flash("Payment deleted", ":material/delete:")
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Page: Reminders
+# ---------------------------------------------------------------------------
+STATUS_CHIPS = {
+    "due": ("Due", "neg"),
+    "cooldown": ("Recently reminded", "blue"),
+    "not_overdue": ("Not overdue yet", ""),
+    "below_min": ("Below minimum", ""),
+    "no_email": ("No email", "warn"),
+}
+
+
+def _when(dt):
+    if not dt:
+        return "never"
+    days = (today - dt.date()).days
+    return "today" if days == 0 else ("yesterday" if days == 1 else f"{days} days ago")
+
+
+def page_reminders():
+    page_header("Reminders", "Email people who owe money a clear statement of what they owe and whom to pay.")
+    s = reminders.get_settings()
+    queue = reminders.get_reminder_queue(None, s)
+    due = [q for q in queue if q["status"] == "due"]
+    nxt = reminders.next_auto_run(s)
+    live = bool(s["live_mode"])
+    smtp_ok = reminders.smtp_is_configured(s)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        if s["auto_enabled"]:
+            when = "now" if nxt and nxt <= datetime.now() else (
+                f"today {nxt:%H:%M}" if nxt.date() == today else f"{nxt:%a %d %b, %H:%M}")
+            tile("Automatic reminders", "On", f"Daily at {int(s['send_hour']):02d}:00 &middot; next run {when}", tone="pos")
+        else:
+            tile("Automatic reminders", "Off", "Turn on in the Schedule tab")
+    with k2:
+        tile("Delivery", "Live email" if live else "Dry run",
+             ("Emails are sent" if smtp_ok else "Email not configured") if live else "Emails are previewed and logged, not sent",
+             tone="neg" if live and not smtp_ok else "")
+    with k3:
+        tile("Due for a reminder", str(len(due)), f"{fmt(sum(q['total_owed'] for q in due))} outstanding")
+    with k4:
+        tile("Owing money", str(len(queue)), f"{fmt(sum(q['total_owed'] for q in queue))} across all circles")
+
+    if live and not smtp_ok:
+        st.warning("Live delivery is on but email isn't set up. Add SMTP details in the Email delivery tab.",
+                   icon=":material/mail_lock:")
+
+    st.write("")
+    t_queue, t_sched, t_email, t_hist = st.tabs(["Queue", "Schedule", "Email delivery", "History"])
+
+    with t_queue:
+        left, right = st.columns([3, 2], gap="medium")
+        with left:
+            with st.container(border=True):
+                h1, h2 = st.columns([2, 1.3], vertical_alignment="center")
+                with h1:
+                    section("People who owe money",
+                            f"Due once the oldest open item is {int(s['overdue_days'])}+ days old, at most every {int(s['cadence_days'])} days.")
+                with h2:
+                    label = (f"{'Send' if live else 'Simulate'} {len(due)} due reminder{'s' if len(due) != 1 else ''}"
+                             if due else "No reminders due")
+                    if st.button(label, type="primary", disabled=not due, width="stretch", key="send_all_due"):
+                        res = reminders.run_reminders(trigger="manual", settings=s)
+                        st.session_state["last_reminder_run"] = res["results"]
+                        flash(res["message"], ":material/send:")
+                        st.rerun()
+                if not queue:
+                    empty_state("Nobody owes anything", "All circles are settled up.")
+                for q in queue:
+                    label, tone = STATUS_CHIPS[q["status"]]
+                    extra = f" until {q['next_eligible']:%d %b}" if q["status"] == "cooldown" and q["next_eligible"] else ""
+                    circles = ", ".join(c["group_name"] for c in q["circles"])
+                    c1, c2, c3 = st.columns([3, 1.1, 1.6], vertical_alignment="center")
+                    c1.markdown(
+                        f"<div class='row-main'>{esc(q['name'])} &nbsp;{chip(label + extra, tone)}</div>"
+                        f"<div class='row-meta'>{esc(circles)} &middot; oldest item {q['days_outstanding']} days &middot; last reminded {_when(q['last_reminded'])}</div>",
+                        unsafe_allow_html=True)
+                    c2.markdown(f"<div class='row-amt' style='text-align:right'>{fmt(q['total_owed'])}</div>", unsafe_allow_html=True)
+                    with c3:
+                        b1, b2 = st.columns(2)
+                        if b1.button("Preview", key=f"prev_{q['user_id']}", width="stretch", type="tertiary"):
+                            preview_reminder_dialog(q)
+                        if b2.button("Send", key=f"send_{q['user_id']}", width="stretch", disabled=not q["email"],
+                                     help="Sends now, ignoring the schedule" + ("" if live else " (dry run)")):
+                            r = reminders.send_statement_reminder(q, is_dry_run=not live, settings=s, trigger="manual")
+                            flash(r["msg"], ":material/send:" if r["success"] else ":material/error:")
+                            st.rerun()
+            last = st.session_state.get("last_reminder_run")
+            if last:
+                with st.expander("Last run results", expanded=True):
+                    st.dataframe(pd.DataFrame([{"Person": r["name"], "To": r["to"], "Amount": r["amount"],
+                                                "Result": r["status"], "Details": r["msg"]} for r in last]),
+                                 hide_index=True, width="stretch", column_config={"Amount": money_col("Amount")})
+        with right:
+            with st.container(border=True):
+                section("Outstanding by age", "Based on each person's oldest unpaid item.")
+                if queue:
+                    plot(charts.outstanding_by_age(queue, CURR))
+                else:
+                    empty_state("Nothing outstanding", "")
+
+    with t_sched:
+        left, right = st.columns([3, 2], gap="medium")
+        with left:
+            with st.container(border=True):
+                section("Automatic schedule")
+                with st.form("form_schedule"):
+                    enabled = st.toggle("Send reminders automatically every day", value=bool(s["auto_enabled"]))
+                    c1, c2 = st.columns(2)
+                    hour = c1.selectbox("Send at", list(range(24)), index=int(s["send_hour"]), format_func=lambda h: f"{h:02d}:00")
+                    min_amt = c2.number_input(f"Skip balances under ({CURR})", min_value=0.0, value=float(s["min_amount"]), step=50.0)
+                    c3, c4 = st.columns(2)
+                    overdue = c3.number_input("Remind once the oldest item is at least (days)", min_value=0, max_value=90,
+                                              value=int(s["overdue_days"]))
+                    cadence = c4.number_input("Wait between reminders to the same person (days)", min_value=1, max_value=60,
+                                              value=int(s["cadence_days"]))
+                    live_v = st.toggle("Send real emails (turn off for a dry run)", value=live)
+                    if st.form_submit_button("Save schedule", type="primary"):
+                        reminders.save_settings({"auto_enabled": enabled, "send_hour": int(hour), "min_amount": float(min_amt),
+                                                 "overdue_days": int(overdue), "cadence_days": int(cadence), "live_mode": live_v})
+                        flash("Reminder schedule saved")
+                        st.rerun()
+        with right:
+            with st.container(border=True):
+                section("How it works")
+                st.markdown(
+                    "- Each day at the chosen time, everyone marked **Due** gets one email covering all their circles.\n"
+                    "- Balances account for recorded payments and shares marked paid, so people who've paid stop getting reminders.\n"
+                    "- A person is only emailed again after the waiting period, even if you also send manually.\n"
+                    "- In a dry run, emails are rendered and logged in History but not sent."
+                )
+                st.markdown("<div class='muted' style='margin-top:6px'>The schedule runs while this app is running. "
+                            "To keep it running when the app is closed, add this to cron (it uses the same settings and never double-sends):</div>",
+                            unsafe_allow_html=True)
+                st.code(f"5 * * * * cd {BASE_DIR} && {sys.executable} reminders.py --auto >> reminders.log 2>&1", language="bash")
+
+    with t_email:
+        left, right = st.columns([3, 2], gap="medium")
+        creds = reminders.get_smtp_credentials(s)
+        with left:
+            with st.container(border=True):
+                section("SMTP server", "For Gmail use smtp.gmail.com, port 587 and an app password.")
+                with st.form("form_smtp"):
+                    c1, c2 = st.columns([3, 1])
+                    host = c1.text_input("Server", value=s["smtp_host"] or creds["host"])
+                    port = c2.number_input("Port", min_value=1, max_value=65535, value=int(s["smtp_port"] or creds["port"]))
+                    c3, c4 = st.columns(2)
+                    user = c3.text_input("Username", value=s["smtp_user"] or creds["user"], placeholder="you@gmail.com")
+                    pw = c4.text_input("App password", value="", type="password",
+                                       placeholder="Saved — leave blank to keep" if creds["pass"] else "Not set")
+                    c5, c6 = st.columns(2)
+                    from_email = c5.text_input("From address", value=s["from_email"] or creds["from_email"],
+                                               placeholder="Defaults to the username")
+                    sender = c6.text_input("Sender name", value=s["sender_name"] or reminders.APP_NAME)
+                    test_to = st.text_input("Send a test email to", value=ACTIVE.get("email") or "")
+                    b1, b2, _ = st.columns([1, 1, 2])
+                    save = b1.form_submit_button("Save", type="primary", width="stretch")
+                    test = b2.form_submit_button("Save and test", width="stretch")
+                if save or test:
+                    values = {"smtp_host": host.strip(), "smtp_port": int(port), "smtp_user": user.strip(),
+                              "from_email": from_email.strip(), "sender_name": sender.strip() or reminders.APP_NAME}
+                    if pw.strip():
+                        values["smtp_pass"] = pw.strip()
+                    reminders.save_settings(values)
+                    if test:
+                        with st.spinner("Connecting…"):
+                            ok, msg = reminders.test_smtp_connection(test_to_email=test_to.strip() or None)
+                        (st.success if ok else st.error)(msg)
+                    else:
+                        flash("Email settings saved")
+                        st.rerun()
+        with right:
+            with st.container(border=True):
+                section("Status")
+                rows = [("Server", f"{creds['host']}:{creds['port']}"), ("Username", creds["user"] or "Not set"),
+                        ("Password", "Saved" if creds["pass"] else "Not set"), ("From", creds["from_email"] or "Not set")]
+                st.markdown("".join(f"<div class='row'><div class='row-meta'>{k}</div><div class='row-main'>{esc(v)}</div></div>"
+                                    for k, v in rows), unsafe_allow_html=True)
+                st.markdown("<div class='muted' style='margin-top:8px'>Settings are stored in the local database (data/finance.db). "
+                            "Any field left blank falls back to the SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS and FROM_EMAIL environment variables.</div>",
+                            unsafe_allow_html=True)
+                if s["smtp_pass"] and st.button("Forget saved password", type="tertiary"):
+                    reminders.save_settings({"smtp_pass": ""})
+                    flash("Saved password removed", ":material/key_off:")
+                    st.rerun()
+
+    with t_hist:
+        log = db.get_reminder_log(200)
+        with st.container(border=True):
+            if not log:
+                empty_state("No reminders yet", "Sent and simulated reminders will appear here.")
+            else:
+                df = pd.DataFrame(log)
+                show = pd.DataFrame({
+                    "When": pd.to_datetime(df["created_at"]), "Person": df["user_name"].fillna("Deleted person"),
+                    "Amount": df["amount"], "Result": df["status"].str.capitalize(),
+                    "Trigger": df["trigger"].str.capitalize(), "To": df["recipient"], "Details": df["message"],
+                })
+                st.dataframe(show, hide_index=True, width="stretch",
+                             column_config={"When": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
+                                            "Amount": money_col("Amount")})
+
+
+# ---------------------------------------------------------------------------
+# Page: Settings
+# ---------------------------------------------------------------------------
+def page_settings():
+    page_header("Settings", "Preferences, people and data.")
+    t_pref, t_people, t_data = st.tabs(["Preferences", "People", "Data"])
+
+    with t_pref:
+        left, right = st.columns(2, gap="medium")
+        with left:
+            with st.container(border=True):
+                section("Currency", "Used throughout the app and in reminder emails.")
+                cur = st.selectbox("Currency symbol", CURRENCIES, index=CURRENCIES.index(CURR) if CURR in CURRENCIES else 0)
+                if cur != CURR:
+                    reminders.save_settings({"currency": cur})
+                    flash(f"Currency set to {cur}")
+                    st.rerun()
+        with right:
+            with st.container(border=True):
+                section("Your profile", ACTIVE["name"])
+                with st.form("form_profile"):
+                    n = st.text_input("Name", value=ACTIVE["name"])
+                    e = st.text_input("Email", value=ACTIVE.get("email") or "")
+                    p = st.text_input("Mobile (optional)", value=ACTIVE.get("phone") or "")
+                    if st.form_submit_button("Save profile", type="primary"):
+                        ok, err, c_em, c_ph = logic.validate_user_data(n, e, p, exclude_user_id=ACTIVE_ID)
+                        if not ok:
+                            st.error(err)
+                        else:
+                            try:
+                                db.update_user(ACTIVE_ID, name=n, email=c_em, phone=c_ph or "")
+                                flash("Profile saved")
+                                st.rerun()
+                            except ValueError as ex:
+                                st.error(str(ex))
+
+    with t_people:
+        left, right = st.columns([3, 2], gap="medium")
+        with left:
+            with st.container(border=True):
+                section("People", f"{len(users)} profile(s). Everyone can be added to circles and receive reminders.")
+                df = pd.DataFrame(users)
+                st.dataframe(df[["name", "email", "phone", "monthly_budget"]], hide_index=True, width="stretch",
+                             column_config={"name": "Name", "email": "Email", "phone": "Mobile",
+                                            "monthly_budget": money_col("Monthly budget")})
+        with right:
+            with st.container(border=True):
+                section("Add a person")
+                with st.form("form_add_person", clear_on_submit=True):
+                    n = st.text_input("Name")
+                    e = st.text_input("Email")
+                    p = st.text_input("Mobile (optional)")
+                    b = st.number_input(f"Monthly budget ({CURR})", min_value=0.0, value=0.0, step=1000.0)
+                    if st.form_submit_button("Add person", type="primary", width="stretch"):
+                        ok, err, c_em, c_ph = logic.validate_user_data(n, e, p)
+                        if not ok:
+                            st.error(err)
+                        else:
+                            try:
+                                db.create_user(n.strip(), c_em, c_ph, float(b))
+                                flash(f"Added {n.strip()}")
+                                st.rerun()
+                            except ValueError as ex:
+                                st.error(str(ex))
+            with st.container(border=True):
+                section("Remove a person", "Deletes their transactions, splits and payments.")
+                others = [u["user_id"] for u in users]
+                victim = st.selectbox("Person", others, format_func=lambda i: user_map[i]["name"], key="rm_person")
+                ok = st.checkbox("I understand this can't be undone", key="rm_person_ok")
+                if st.button("Remove person", disabled=not ok or len(users) <= 1, width="stretch"):
+                    db.delete_user(victim)
+                    flash(f"Removed {user_map[victim]['name']}", ":material/person_remove:")
+                    st.rerun()
+
+    with t_data:
+        c1, c2, c3 = st.columns(3, gap="medium")
+        exports = [
+            (c1, "Expenses", db.get_all_expenses(), "expenses"),
+            (c2, "Income", db.get_user_incomes(), "income"),
+            (c3, "Payments", db.get_settlements(), "payments"),
+        ]
+        for col, title, rows, slug in exports:
+            with col:
+                with st.container(border=True):
+                    section(title, f"{len(rows)} record(s), all people")
+                    st.download_button("Download CSV", data=pd.DataFrame(rows).to_csv(index=False).encode("utf-8"),
+                                       file_name=f"{slug}_{today.isoformat()}.csv", mime="text/csv",
+                                       disabled=not rows, width="stretch", key=f"dl_{slug}", icon=":material/download:")
+        with st.container(border=True):
+            section("Reset", "Both actions replace everything in the database. Reminder and email settings are kept.")
+            ok = st.checkbox("I understand all current data will be erased", key="reset_ok")
+            b1, b2, _ = st.columns([1, 1, 2])
+            if b1.button("Load sample data", disabled=not ok, width="stretch"):
+                db.seed_comprehensive_demo_data(reset=True)
+                st.session_state.clear()
+                flash("Sample data loaded")
+                st.rerun()
+            if b2.button("Erase everything", disabled=not ok, width="stretch"):
+                db.reset_database()
+                st.session_state.clear()
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Navigation
+# ---------------------------------------------------------------------------
+PAGE_OVERVIEW = st.Page(page_overview, title="Overview", icon=":material/space_dashboard:", url_path="overview", default=True)
+PAGE_TRANSACTIONS = st.Page(page_transactions, title="Transactions", icon=":material/receipt_long:", url_path="transactions")
+PAGE_BUDGETS = st.Page(page_budgets, title="Budgets", icon=":material/savings:", url_path="budgets")
+PAGE_REPORTS = st.Page(page_reports, title="Reports", icon=":material/insights:", url_path="reports")
+PAGE_CIRCLES = st.Page(page_circles, title="Circles", icon=":material/group:", url_path="circles")
+PAGE_SETTLE = st.Page(page_settle, title="Settle up", icon=":material/handshake:", url_path="settle-up")
+PAGE_REMINDERS = st.Page(page_reminders, title="Reminders", icon=":material/notifications:", url_path="reminders")
+PAGE_SETTINGS = st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings")
+
+nav = st.navigation({
+    "Personal": [PAGE_OVERVIEW, PAGE_TRANSACTIONS, PAGE_BUDGETS, PAGE_REPORTS],
+    "Shared": [PAGE_CIRCLES, PAGE_SETTLE, PAGE_REMINDERS],
+    "Account": [PAGE_SETTINGS],
+})
+
+with st.sidebar:
+    st.markdown(
+        f"<div class='muted' style='margin-top:4px'>Automatic reminders: "
+        f"<b style='color:var(--ink)'>{'On' if SETTINGS['auto_enabled'] else 'Off'}</b>"
+        f"{' &middot; dry run' if SETTINGS['auto_enabled'] and not SETTINGS['live_mode'] else ''}</div>",
+        unsafe_allow_html=True,
+    )
+
+nav.run()

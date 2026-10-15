@@ -4,10 +4,28 @@ SQLite with normalized schema, foreign keys, full CRUD, and migrations.
 """
 import sqlite3
 import os
+import json
 from datetime import datetime, date, timedelta
 import random
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "finance.db")
+DB_PATH = os.environ.get(
+    "BUDGET_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "finance.db"),
+)
+
+EXPENSE_CATEGORIES = [
+    "Food & Dining", "Groceries", "Housing & Rent", "Utilities", "Transportation",
+    "Entertainment", "Health & Medical", "Shopping", "Travel", "Education", "Other",
+]
+SHARED_CATEGORIES = ["General"] + EXPENSE_CATEGORIES
+INCOME_SOURCES = ["Salary", "Freelance & Consulting", "Investments & Dividends", "Reimbursements", "Gifts", "Other"]
+PAYMENT_METHODS = ["UPI", "Debit Card", "Credit Card", "Bank Transfer", "Cash", "Other"]
+SETTLEMENT_METHODS = ["UPI", "Bank Transfer", "Cash", "Card", "Other"]
+
+ALL_TABLES = [
+    "reminder_log", "splits", "shared_expenses", "settlements", "group_members", "groups",
+    "category_budgets", "incomes", "expenses", "users",
+]
 
 def get_db_connection():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -103,7 +121,7 @@ CREATE TABLE IF NOT EXISTS settlements (
     to_user        INTEGER NOT NULL,
     amount         REAL NOT NULL CHECK(amount > 0),
     group_id       INTEGER,
-    date           TEXT DEFAULT (datetime('now')),
+    date           TEXT DEFAULT (datetime('now', 'localtime')),
     note           TEXT,
     payment_method TEXT DEFAULT 'Cash',
     FOREIGN KEY(from_user) REFERENCES users(user_id) ON DELETE CASCADE,
@@ -111,6 +129,26 @@ CREATE TABLE IF NOT EXISTS settlements (
     FOREIGN KEY(group_id)  REFERENCES groups(group_id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS app_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reminder_log (
+    log_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER,
+    group_id   INTEGER,
+    amount     REAL DEFAULT 0,
+    recipient  TEXT,
+    subject    TEXT,
+    status     TEXT NOT NULL,
+    trigger    TEXT DEFAULT 'manual',
+    message    TEXT,
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_reminder_log_user ON reminder_log(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date);
 CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
 CREATE INDEX IF NOT EXISTS idx_incomes_user_date ON incomes(user_id, date);
@@ -132,7 +170,9 @@ def run_migrations(conn):
         "ALTER TABLE expenses ADD COLUMN payment_method TEXT DEFAULT 'Card'",
         "ALTER TABLE expenses ADD COLUMN notes TEXT",
         "ALTER TABLE shared_expenses ADD COLUMN category TEXT DEFAULT 'General'",
-        "ALTER TABLE settlements ADD COLUMN payment_method TEXT DEFAULT 'Cash'"
+        "ALTER TABLE settlements ADD COLUMN payment_method TEXT DEFAULT 'Cash'",
+        # Data fix: a payer's own share of a bill is settled by definition.
+        "UPDATE splits SET is_paid = 1 WHERE is_paid = 0 AND user_id = (SELECT payer_id FROM shared_expenses se WHERE se.shared_id = splits.shared_id)",
     ]
     for sql in migrations:
         try:
@@ -469,13 +509,33 @@ def get_distinct_categories(user_id=None):
 
 # --- Groups CRUD ---
 def create_group(group_name):
+    group_name = str(group_name or "").strip()
+    if not group_name:
+        raise ValueError("Circle name is required.")
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO groups (group_name) VALUES (?)", (group_name,))
-    conn.commit()
-    gid = cur.lastrowid
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO groups (group_name) VALUES (?)", (group_name,))
+        conn.commit()
+        gid = cur.lastrowid
+    except sqlite3.IntegrityError:
+        raise ValueError(f"A circle named '{group_name}' already exists.")
+    finally:
+        conn.close()
     return gid
+
+def rename_group(group_id, group_name):
+    group_name = str(group_name or "").strip()
+    if not group_name:
+        raise ValueError("Circle name is required.")
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE groups SET group_name = ? WHERE group_id = ?", (group_name, group_id))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise ValueError(f"A circle named '{group_name}' already exists.")
+    finally:
+        conn.close()
 
 def get_all_groups():
     conn = get_db_connection()
@@ -523,30 +583,60 @@ def get_user_groups(user_id):
     return [dict(r) for r in rows]
 
 # --- Shared Expenses & Splits ---
+def allocate_amounts(total, weights):
+    """
+    Split `total` proportionally to `weights` (list of non-negative numbers), working in
+    whole cents so the parts always add back up to the exact total (largest-remainder method).
+    """
+    total_cents = int(round(float(total) * 100))
+    weights = [max(0.0, float(w)) for w in weights]
+    w_sum = sum(weights)
+    if not weights or w_sum <= 0:
+        raise ValueError("Allocation weights must contain at least one positive value")
+    raw = [total_cents * w / w_sum for w in weights]
+    cents = [int(r) for r in raw]
+    leftover = total_cents - sum(cents)
+    order = sorted(range(len(raw)), key=lambda i: (raw[i] - cents[i]), reverse=True)
+    for i in order[:leftover]:
+        cents[i] += 1
+    return [c / 100 for c in cents]
+
 def add_shared_expense(group_id, payer_id, amount, description, date=None, split_among=None, custom_splits=None, category="General"):
     if date is None: date = datetime.now().strftime("%Y-%m-%d")
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO shared_expenses (group_id, payer_id, amount, description, date, category) VALUES (?, ?, ?, ?, ?, ?)",
-        (group_id, payer_id, amount, description, date, category)
-    )
-    shared_id = cur.lastrowid
+    amount = round(float(amount), 2)
+
     if custom_splits:
-        for uid, owed in custom_splits.items():
-            cur.execute("INSERT INTO splits (shared_id, user_id, amount_owed) VALUES (?, ?, ?)", (shared_id, uid, owed))
+        split_items = [(uid, round(float(owed), 2)) for uid, owed in custom_splits.items()]
+        if abs(sum(o for _, o in split_items) - amount) > 0.01:
+            raise ValueError("Split amounts must add up to the bill total")
     else:
+        conn = get_db_connection()
         if split_among is None:
             members = conn.execute("SELECT user_id FROM group_members WHERE group_id = ?", (group_id,)).fetchall()
             split_among = [r["user_id"] for r in members]
-        if not split_among: raise ValueError("No members to split among")
-        per_person = round(amount / len(split_among), 2)
-        remainder = round(amount - per_person * len(split_among), 2)
-        for i, uid in enumerate(split_among):
-            owed = per_person + (remainder if i == 0 else 0)
-            cur.execute("INSERT INTO splits (shared_id, user_id, amount_owed) VALUES (?, ?, ?)", (shared_id, uid, owed))
-    conn.commit()
-    conn.close()
+        conn.close()
+        if not split_among:
+            raise ValueError("No members to split among")
+        split_items = list(zip(split_among, allocate_amounts(amount, [1] * len(split_among))))
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO shared_expenses (group_id, payer_id, amount, description, date, category) VALUES (?, ?, ?, ?, ?, ?)",
+            (group_id, payer_id, amount, description, date, category)
+        )
+        shared_id = cur.lastrowid
+        for uid, owed in split_items:
+            # The payer's own share is settled by definition.
+            is_paid = 1 if uid == payer_id else 0
+            cur.execute(
+                "INSERT INTO splits (shared_id, user_id, amount_owed, is_paid) VALUES (?, ?, ?, ?)",
+                (shared_id, uid, owed, is_paid)
+            )
+        conn.commit()
+    finally:
+        conn.close()
     return shared_id
 
 def delete_shared_expense(shared_id):
@@ -594,12 +684,16 @@ def mark_user_paid_for_expense(shared_id, user_id, paid=True):
     conn.close()
 
 # --- Settlements CRUD ---
-def add_settlement(from_user, to_user, amount, group_id=None, note="", payment_method="Cash"):
+def add_settlement(from_user, to_user, amount, group_id=None, note="", payment_method="Cash", date=None):
+    if from_user == to_user:
+        raise ValueError("Payer and receiver must be different people")
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO settlements (from_user, to_user, amount, group_id, note, payment_method) VALUES (?, ?, ?, ?, ?, ?)",
-        (from_user, to_user, amount, group_id, note, payment_method)
+        "INSERT INTO settlements (from_user, to_user, amount, group_id, note, payment_method, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (from_user, to_user, round(float(amount), 2), group_id, note, payment_method, date)
     )
     conn.commit()
     sid = cur.lastrowid
@@ -635,98 +729,263 @@ def get_settlements(group_id=None):
     conn.close()
     return [dict(r) for r in rows]
 
-# --- Demo Data Generator ---
-def seed_comprehensive_demo_data(reset=False):
-    """Populates realistic, vibrant financial dataset for instant demo and testing."""
+# --- App Settings (key/value, JSON encoded) ---
+def get_setting(key, default=None):
     conn = get_db_connection()
-    if reset:
-        tables = ["splits", "shared_expenses", "settlements", "group_members", "groups", "category_budgets", "incomes", "expenses", "users"]
-        for t in tables:
-            conn.execute(f"DROP TABLE IF EXISTS {t}")
+    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    if row is None or row["value"] is None:
+        return default
+    try:
+        return json.loads(row["value"])
+    except (TypeError, ValueError):
+        return default
+
+def get_settings(defaults):
+    """Return a dict of settings, filling any missing key from `defaults`."""
+    conn = get_db_connection()
+    rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    conn.close()
+    stored = {}
+    for r in rows:
+        try:
+            stored[r["key"]] = json.loads(r["value"])
+        except (TypeError, ValueError):
+            pass
+    return {k: stored.get(k, v) for k, v in defaults.items()}
+
+def set_setting(key, value):
+    set_settings({key: value})
+
+def set_settings(values):
+    conn = get_db_connection()
+    conn.executemany(
+        "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [(k, json.dumps(v)) for k, v in values.items()],
+    )
+    conn.commit()
+    conn.close()
+
+def compare_and_set_setting(key, expected, new_value):
+    """
+    Atomically set `key` to `new_value` only if it currently equals `expected`.
+    Used so the in-app scheduler and a cron job never both claim the same daily run.
+    """
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        current = json.loads(row["value"]) if row and row["value"] is not None else None
+        if current != expected:
+            conn.rollback()
+            return False
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, json.dumps(new_value)),
+        )
         conn.commit()
+        return True
+    finally:
+        conn.close()
+
+# --- Reminder Log ---
+def log_reminder(user_id, group_id, amount, recipient, subject, status, trigger="manual", message=""):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO reminder_log (user_id, group_id, amount, recipient, subject, status, trigger, message, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, group_id, amount, recipient, subject, status, trigger, message,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    lid = cur.lastrowid
+    conn.close()
+    return lid
+
+def get_reminder_log(limit=100, user_id=None):
+    conn = get_db_connection()
+    q = ("SELECT rl.*, u.name AS user_name FROM reminder_log rl "
+         "LEFT JOIN users u ON rl.user_id = u.user_id")
+    params = []
+    if user_id:
+        q += " WHERE rl.user_id = ?"
+        params.append(user_id)
+    q += " ORDER BY rl.created_at DESC, rl.log_id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_last_reminder_times(statuses=("sent",)):
+    """Return {user_id: last created_at} for reminders with the given statuses."""
+    conn = get_db_connection()
+    placeholders = ",".join("?" * len(statuses))
+    rows = conn.execute(
+        f"SELECT user_id, MAX(created_at) AS last_at FROM reminder_log WHERE status IN ({placeholders}) GROUP BY user_id",
+        list(statuses),
+    ).fetchall()
+    conn.close()
+    return {r["user_id"]: r["last_at"] for r in rows}
+
+# --- Reporting queries ---
+def get_daily_spending(user_id, month):
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT date, SUM(amount) AS total FROM expenses WHERE user_id = ? AND substr(date,1,7) = ? GROUP BY date ORDER BY date",
+        (user_id, month),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_monthly_category_spending(user_id):
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT substr(date,1,7) AS month, category, SUM(amount) AS total FROM expenses "
+        "WHERE user_id = ? GROUP BY month, category ORDER BY month",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_incomes_filtered(user_id=None, start_date=None, end_date=None, search=None, limit=None):
+    conn = get_db_connection()
+    query = "SELECT i.*, u.name as user_name FROM incomes i JOIN users u ON i.user_id = u.user_id WHERE 1=1"
+    params = []
+    if user_id:
+        query += " AND i.user_id = ?"; params.append(user_id)
+    if start_date:
+        query += " AND i.date >= ?"; params.append(start_date)
+    if end_date:
+        query += " AND i.date <= ?"; params.append(end_date)
+    if search:
+        query += " AND (i.description LIKE ? OR i.source LIKE ?)"
+        params.extend([f"%{search}%", f"%{search}%"])
+    query += " ORDER BY i.date DESC, i.income_id DESC"
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def reset_database():
+    """Drop every table and recreate an empty schema. App settings are kept."""
+    conn = get_db_connection()
+    conn.execute("PRAGMA foreign_keys = OFF;")
+    for t in ALL_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {t}")
+    conn.commit()
     conn.close()
     init_db()
+
+# --- Demo Data Generator ---
+def _month_start(d, months_back):
+    """First day of the month `months_back` months before d (negative = months ahead)."""
+    idx = d.year * 12 + (d.month - 1) - months_back
+    return date(idx // 12, idx % 12 + 1, 1)
+
+month_start = _month_start
+
+
+def seed_comprehensive_demo_data(reset=False):
+    """Populate a realistic six-month dataset for demos and testing. Amounts are in INR."""
+    if reset:
+        reset_database()
+    else:
+        init_db()
 
     conn = get_db_connection()
     user_count = conn.execute("SELECT count(*) FROM users").fetchone()[0]
     conn.close()
-
     if user_count > 0 and not reset:
         return False  # Already seeded
 
-    # Create Core Users
-    u_alice = create_user("Alice Johnson", "alice@example.com", "9876543210", 2200.0)
-    u_bob = create_user("Bob Martinez", "bob@example.com", "9876543211", 1800.0)
-    u_charlie = create_user("Charlie Chen", "charlie@example.com", "9876543212", 1500.0)
-    u_diana = create_user("Diana Prince", "diana@example.com", "9876543213", 2000.0)
-
-    # Category Budgets for Alice
-    set_category_budget(u_alice, "Food & Dining", 500.0)
-    set_category_budget(u_alice, "Housing & Rent", 900.0)
-    set_category_budget(u_alice, "Groceries", 300.0)
-    set_category_budget(u_alice, "Utilities", 150.0)
-    set_category_budget(u_alice, "Entertainment", 150.0)
-    set_category_budget(u_alice, "Transportation", 200.0)
-
-    # Incomes for Alice
+    rng = random.Random(42)
     today = date.today()
-    first_of_month = today.replace(day=1)
-    add_income(u_alice, 3200.0, "Salary", first_of_month.isoformat(), "Tech Corp Bi-weekly Pay")
-    add_income(u_alice, 450.0, "Freelance", (today - timedelta(days=4)).isoformat(), "UI/UX Consult Project")
-    add_income(u_bob, 2800.0, "Salary", first_of_month.isoformat(), "Monthly Paycheck")
-    add_income(u_charlie, 2400.0, "Salary", first_of_month.isoformat(), "Full-time Engineering")
 
-    # Personal Expenses for Alice & others
-    personal_samples = [
-        (u_alice, 850.0, "Housing & Rent", first_of_month.isoformat(), "Monthly Apartment Rent Share", "Bank Transfer"),
-        (u_alice, 115.40, "Groceries", (today - timedelta(days=2)).isoformat(), "Trader Joe's organic restock", "Credit Card"),
-        (u_alice, 38.50, "Food & Dining", (today - timedelta(days=3)).isoformat(), "Sushi dinner with friends", "Card"),
-        (u_alice, 14.99, "Entertainment", (today - timedelta(days=6)).isoformat(), "Netflix & Spotify subscription", "Card"),
-        (u_alice, 45.00, "Transportation", (today - timedelta(days=7)).isoformat(), "Weekly transit card reload", "Card"),
-        (u_alice, 82.20, "Utilities", (today - timedelta(days=9)).isoformat(), "High-speed Fiber Internet", "Bank Transfer"),
-        (u_alice, 26.50, "Food & Dining", (today - timedelta(days=11)).isoformat(), "Chipotle burrito bowls", "UPI / Cash"),
-        (u_alice, 64.00, "Shopping", (today - timedelta(days=12)).isoformat(), "Ergonomic keyboard wrist rest", "Credit Card"),
-        (u_bob, 750.0, "Housing & Rent", first_of_month.isoformat(), "Rent Share", "Bank Transfer"),
-        (u_bob, 89.0, "Groceries", (today - timedelta(days=5)).isoformat(), "Whole Foods run", "Card"),
-        (u_charlie, 42.0, "Food & Dining", (today - timedelta(days=4)).isoformat(), "Italian Bistro lunch", "Card"),
+    u_alice = create_user("Alice Johnson", "alice@example.com", "9876543210", 60000.0)
+    u_bob = create_user("Bob Martinez", "bob@example.com", "9876543211", 45000.0)
+    u_charlie = create_user("Charlie Chen", "charlie@example.com", "9876543212", 40000.0)
+    u_diana = create_user("Diana Prince", "diana@example.com", "9876543213", 50000.0)
+
+    for cat, limit in [
+        ("Housing & Rent", 22000), ("Groceries", 8000), ("Food & Dining", 6000),
+        ("Utilities", 4000), ("Transportation", 3500), ("Entertainment", 3000), ("Shopping", 5000),
+    ]:
+        set_category_budget(u_alice, cat, float(limit))
+
+    # Recurring monthly pattern for Alice, plus a lighter pattern for others
+    profiles = {
+        u_alice: {"salary": 95000, "rent": 21000},
+        u_bob: {"salary": 72000, "rent": 18000},
+        u_charlie: {"salary": 64000, "rent": 16000},
+        u_diana: {"salary": 88000, "rent": 20000},
+    }
+    variable = [
+        ("Groceries", "BigBasket order", (900, 2600), 3, "UPI"),
+        ("Food & Dining", "Dinner out", (450, 1800), 4, "Credit Card"),
+        ("Food & Dining", "Swiggy order", (250, 700), 4, "UPI"),
+        ("Transportation", "Uber ride", (180, 650), 5, "UPI"),
+        ("Transportation", "Metro card recharge", (500, 500), 1, "Debit Card"),
+        ("Entertainment", "Movie tickets", (400, 1100), 1, "Credit Card"),
+        ("Shopping", "Amazon order", (600, 3800), 2, "Credit Card"),
+        ("Health & Medical", "Pharmacy", (200, 900), 1, "UPI"),
     ]
-    for uid, amt, cat, dt, desc, pmethod in personal_samples:
-        add_expense(uid, amt, cat, dt, desc, pmethod)
 
-    # Groups
-    g_apt = create_group("Apartment 4B Circle")
-    g_trip = create_group("Weekend Lakehouse Trip")
+    for uid, prof in profiles.items():
+        intensity = 1.0 if uid == u_alice else 0.45
+        for back in range(5, -1, -1):
+            start = _month_start(today, back)
+            month_len = ((_month_start(today, back - 1) if back > 0 else _month_start(today, -1)) - timedelta(days=1)).day
+            last_day = today.day if back == 0 else month_len
+            elapsed = last_day / month_len  # the current month only has part of its spending so far
 
+            def day(n):
+                return start.replace(day=min(n, last_day)).isoformat()
+
+            add_income(uid, float(prof["salary"]), "Salary", day(1), "Monthly salary")
+            if uid == u_alice and back % 2 == 0:
+                add_income(uid, float(rng.choice([8000, 12000, 15000])), "Freelance & Consulting", day(18), "Design consulting project")
+            add_expense(uid, float(prof["rent"]), "Housing & Rent", day(2), "Apartment rent", "Bank Transfer")
+            add_expense(uid, float(rng.randint(1400, 2600)), "Utilities", day(10), "Electricity bill", "UPI")
+            add_expense(uid, 999.0, "Utilities", day(12), "Fiber internet", "Credit Card")
+            add_expense(uid, 649.0, "Entertainment", day(5), "Streaming subscriptions", "Credit Card")
+
+            for cat, desc, (lo, hi), per_month, method in variable:
+                count = max(0, round(per_month * intensity * elapsed + rng.uniform(-0.6, 0.6)))
+                for _ in range(count):
+                    d = rng.randint(1, last_day)
+                    add_expense(uid, float(rng.randint(lo, hi)), cat, day(d), desc, method)
+
+    # Circles
+    g_apt = create_group("Apartment 4B")
+    g_trip = create_group("Goa Weekend Trip")
     for uid in [u_alice, u_bob, u_charlie]:
         add_member_to_group(g_apt, uid)
     for uid in [u_alice, u_bob, u_charlie, u_diana]:
         add_member_to_group(g_trip, uid)
 
-    # Shared Expenses
-    s1 = add_shared_expense(
-        g_apt, u_alice, 180.0, "Costco Bulk Household Supplies",
-        (today - timedelta(days=1)).isoformat(),
-        split_among=[u_alice, u_bob, u_charlie], category="Groceries"
-    )
-    s2 = add_shared_expense(
-        g_apt, u_bob, 96.0, "Electricity & Gas Bill",
-        (today - timedelta(days=8)).isoformat(),
-        split_among=[u_alice, u_bob, u_charlie], category="Utilities"
-    )
-    s3 = add_shared_expense(
-        g_trip, u_diana, 440.0, "Lakehouse Airbnb Reservation",
-        (today - timedelta(days=5)).isoformat(),
-        split_among=[u_alice, u_bob, u_charlie, u_diana], category="Travel"
-    )
+    def ago(n):
+        return (today - timedelta(days=n)).isoformat()
 
-    # Mark s2 for Alice paid (so Bob's electricity bill has partial payments)
-    splits_s2 = get_splits_for_expense(s2)
-    for s in splits_s2:
+    add_shared_expense(g_apt, u_alice, 5400.0, "Monthly groceries restock", ago(1),
+                       split_among=[u_alice, u_bob, u_charlie], category="Groceries")
+    s_elec = add_shared_expense(g_apt, u_bob, 2880.0, "Electricity & gas bill", ago(8),
+                                split_among=[u_alice, u_bob, u_charlie], category="Utilities")
+    add_shared_expense(g_apt, u_alice, 1199.0, "Wi-Fi plan (quarterly)", ago(20),
+                       split_among=[u_alice, u_bob, u_charlie], category="Utilities")
+    add_shared_expense(g_trip, u_diana, 18000.0, "Villa booking", ago(12),
+                       split_among=[u_alice, u_bob, u_charlie, u_diana], category="Travel")
+    add_shared_expense(g_trip, u_bob, 4800.0, "Seafood dinner", ago(11),
+                       custom_splits=dict(zip([u_alice, u_bob, u_charlie, u_diana],
+                                              allocate_amounts(4800.0, [1, 2, 1, 2]))),
+                       category="Food & Dining")
+
+    # Alice paid her electricity share directly; Charlie settled his via UPI.
+    for s in get_splits_for_expense(s_elec):
         if s["user_id"] == u_alice:
             mark_split_paid(s["split_id"], True)
-
-    # Record a settlement: Charlie settled $32 with Bob
-    add_settlement(u_charlie, u_bob, 32.0, g_apt, "Settled electricity bill via Venmo", "Venmo")
+    add_settlement(u_charlie, u_bob, 960.0, g_apt, "Electricity share", "UPI")
 
     return True
 
