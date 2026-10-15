@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="200" height="32" viewBox="0 0 200 32">
-  <rect x="0" y="4" width="24" height="24" rx="6" fill="#2a78d6"/>
+  <rect x="0" y="4" width="24" height="24" rx="6" fill="#7fa6e3"/>
   <path d="M7 19.5 L11 15.5 L14 18 L18 12.5" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-  <text x="33" y="21.5" font-family="Inter, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="700" fill="#1a1a19" letter-spacing="-0.2">Smart Budgeter</text>
+  <text x="33" y="21.5" font-family="Inter, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="700" fill="#2b2d42" letter-spacing="-0.2">Smart Budgeter</text>
 </svg>
