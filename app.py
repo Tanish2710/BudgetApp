@@ -42,15 +42,80 @@ CURR = SETTINGS.get("currency") or "₹"
 CURRENCIES = ["₹", "$", "€", "£", "¥"]
 
 # ---------------------------------------------------------------------------
+# Light / dark mode
+# ---------------------------------------------------------------------------
+# Streamlit's own widgets take their colours from [theme.light] / [theme.dark] in
+# .streamlit/config.toml; the browser remembers which one is active in localStorage.
+# Python needs to know the choice from the very first run (for the CSS tokens and
+# the chart colours), so it is mirrored into a cookie that arrives with the request.
+THEME_COOKIE = "sb_theme"
+PROFILE_COOKIE = "sb_profile"  # carries "Viewing as" across the reload a theme switch needs
+
+if "dark_mode" not in st.session_state:
+    st.session_state["dark_mode"] = st.context.cookies.get(THEME_COOKIE) == "dark"
+DARK = st.session_state["dark_mode"]
+
+TOKENS = {
+    False: {
+        "ink": "#2b2d42", "ink-2": "#565a6e", "muted": "#80849a", "line": "#e2e4ee",
+        "surface": "#fcfcfe", "plane": "#f5f6fa", "track": "#eceef5", "accent": "#5274c4",
+        "pos": "#2f7d5b", "neg": "#bb4a48", "warn": "#93661a", "blue": "#3f63b0",
+        "pos-bg": "#eef8f2", "pos-line": "#cfe8da", "neg-bg": "#fdf2f1", "neg-line": "#f4d6d3",
+        "warn-bg": "#fdf7ea", "warn-line": "#f0e0b8", "blue-bg": "#eef2fb", "blue-line": "#d6e0f5",
+    },
+    True: {
+        "ink": "#e3e5f0", "ink-2": "#b3b7ca", "muted": "#8c91a8", "line": "#343849",
+        "surface": "#232636", "plane": "#1d1f2b", "track": "#2e3244", "accent": "#6f8dd6",
+        "pos": "#86d0aa", "neg": "#f0a19e", "warn": "#e8c47e", "blue": "#a3bbf0",
+        "pos-bg": "#1f3329", "pos-line": "#2f4d3d", "neg-bg": "#3a2427", "neg-line": "#5a3436",
+        "warn-bg": "#36301f", "warn-line": "#54482b", "blue-bg": "#232c45", "blue-line": "#34416a",
+    },
+}
+
+
+def _theme_sync_script(dark, profile_id=None):
+    """Point Streamlit's theme at the chosen mode, and reload once if it was showing the other one."""
+    want = "Dark" if dark else "Light"
+    profile = f"document.cookie = '{PROFILE_COOKIE}={int(profile_id)}; path=/; max-age=60; SameSite=Lax';" if profile_id else ""
+    return f"""<script>
+(() => {{
+  const want = "{want}";
+  const key = "stActiveTheme-" + window.location.pathname + "-v2";
+  document.cookie = "{THEME_COOKIE}={want.lower()}; path=/; max-age=31536000; SameSite=Lax";
+  let stored = null;
+  try {{ stored = JSON.parse(window.localStorage.getItem(key)); }} catch (e) {{}}
+  if (stored === want) return;
+  window.localStorage.setItem(key, JSON.stringify(want));
+  // Only reload when the page is actually painted in the other mode.
+  const app = document.querySelector(".stApp");
+  const rgb = app ? getComputedStyle(app).backgroundColor.match(/\\d+/g) : null;
+  const showingDark = rgb ? (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) < 128 : null;
+  if (showingDark !== (want === "Dark")) {{ {profile} window.location.reload(); }}
+}})();
+</script>"""
+
+
+def _on_theme_toggle():
+    st.session_state["_theme_switch"] = True
+
+
+def theme_toggle(profile_id=None):
+    """Sidebar switch between light and dark mode."""
+    with st.sidebar:
+        st.toggle("Dark mode", key="dark_mode", on_change=_on_theme_toggle)
+        st.html(_theme_sync_script(st.session_state["dark_mode"],
+                                   profile_id if st.session_state.pop("_theme_switch", False) else None),
+                unsafe_allow_javascript=True)
+
+
+# ---------------------------------------------------------------------------
 # Styles (layered on the theme in .streamlit/config.toml)
 # ---------------------------------------------------------------------------
+_root_vars = "; ".join(f"--{k}: {v}" for k, v in TOKENS[DARK].items())
+st.markdown(f"<style>:root {{ {_root_vars}; color-scheme: {'dark' if DARK else 'light'}; }}</style>",
+            unsafe_allow_html=True)
 st.markdown("""
 <style>
-  :root {
-    --ink: #2b2d42; --ink-2: #565a6e; --muted: #80849a;
-    --line: #e2e4ee; --surface: #fcfcfe; --plane: #f5f6fa; --track: #eceef5;
-    --accent: #5274c4; --pos: #2f7d5b; --neg: #bb4a48; --warn: #93661a;
-  }
   .block-container { max-width: 1240px; padding-top: 2.4rem; padding-bottom: 4rem; }
   footer, [data-testid="stAppDeployButton"] { display: none !important; }
   h1, h2, h3, h4 { letter-spacing: -0.015em; }
@@ -87,10 +152,10 @@ st.markdown("""
 
   .chip { display: inline-block; font-size: .72rem; font-weight: 600; padding: 2px 8px; border-radius: 999px;
           border: 1px solid var(--line); color: var(--ink-2); background: var(--plane); white-space: nowrap; }
-  .chip-pos { color: var(--pos); background: #eef8f2; border-color: #cfe8da; }
-  .chip-neg { color: var(--neg); background: #fdf2f1; border-color: #f4d6d3; }
-  .chip-warn { color: var(--warn); background: #fdf7ea; border-color: #f0e0b8; }
-  .chip-blue { color: #3f63b0; background: #eef2fb; border-color: #d6e0f5; }
+  .chip-pos { color: var(--pos); background: var(--pos-bg); border-color: var(--pos-line); }
+  .chip-neg { color: var(--neg); background: var(--neg-bg); border-color: var(--neg-line); }
+  .chip-warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-line); }
+  .chip-blue { color: var(--blue); background: var(--blue-bg); border-color: var(--blue-line); }
 
   .empty { text-align: center; padding: 36px 16px; color: var(--ink-2); }
   .empty b { display: block; color: var(--ink); font-size: 1rem; margin-bottom: 4px; }
@@ -171,6 +236,8 @@ def empty_state(title, body=""):
 
 
 def plot(fig):
+    if DARK:
+        fig = charts.to_dark(fig)
     st.plotly_chart(fig, width="stretch", config=charts.PLOTLY_CONFIG)
 
 
@@ -195,7 +262,7 @@ group_map = {g["group_id"]: g for g in groups}
 today = date.today()
 cur_month = today.strftime("%Y-%m")
 
-st.logo(os.path.join(BASE_DIR, "assets", "logo.svg"), icon_image=os.path.join(BASE_DIR, "assets", "mark.svg"), size="large")
+st.logo(os.path.join(BASE_DIR, "assets", "logo-dark.svg" if DARK else "logo.svg"), icon_image=os.path.join(BASE_DIR, "assets", "mark.svg"), size="large")
 
 # ---------------------------------------------------------------------------
 # First run
@@ -223,13 +290,15 @@ if not users:
         if st.button("Explore with sample data", width="stretch"):
             db.seed_comprehensive_demo_data(reset=True)
             st.rerun()
+    theme_toggle()
     st.stop()
 
 # ---------------------------------------------------------------------------
 # Sidebar: active profile
 # ---------------------------------------------------------------------------
 user_ids = [u["user_id"] for u in users]
-ensure_choice("active_user_id", user_ids)
+_profile_cookie = st.context.cookies.get(PROFILE_COOKIE, "")
+ensure_choice("active_user_id", user_ids, int(_profile_cookie) if _profile_cookie.isdigit() else None)
 with st.sidebar:
     st.selectbox("Viewing as", user_ids, format_func=lambda i: user_map[i]["name"], key="active_user_id")
 
@@ -1390,5 +1459,6 @@ with st.sidebar:
         f"{' &middot; dry run' if SETTINGS['auto_enabled'] and not SETTINGS['live_mode'] else ''}</div>",
         unsafe_allow_html=True,
     )
+theme_toggle(ACTIVE_ID)
 
 nav.run()

@@ -1,23 +1,42 @@
+# Shared theme settings. Colours live in [theme.light] and [theme.dark]; the
+# sidebar toggle in app.py picks one of the two for each browser.
 [theme]
-base = "light"
-primaryColor = "#5274c4"
-backgroundColor = "#f5f6fa"
-secondaryBackgroundColor = "#eef0f6"
-textColor = "#2b2d42"
-borderColor = "#e2e4ee"
 showWidgetBorder = true
 baseRadius = "8px"
 buttonRadius = "8px"
 baseFontSize = 14
 font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, sans-serif"
 headingFontWeights = [700, 650, 600, 600, 600, 600]
-dataframeHeaderBackgroundColor = "#f5f6fa"
 showSidebarBorder = true
+
+[theme.light]
+base = "light"
+primaryColor = "#5274c4"
+backgroundColor = "#f5f6fa"
+secondaryBackgroundColor = "#eef0f6"
+textColor = "#2b2d42"
+borderColor = "#e2e4ee"
+dataframeHeaderBackgroundColor = "#f5f6fa"
 chartCategoricalColors = ["#7fa6e3", "#f2a07b", "#6fc4a1", "#f0c75e", "#eb9cc0", "#9cc47a", "#a99be3", "#e98b8b"]
 
-[theme.sidebar]
+[theme.light.sidebar]
 backgroundColor = "#fbfbfd"
 secondaryBackgroundColor = "#eff1f7"
+
+# Soft slate-indigo night palette: no pure black, muted text, pastel accents.
+[theme.dark]
+base = "dark"
+primaryColor = "#6f8dd6"
+backgroundColor = "#1d1f2b"
+secondaryBackgroundColor = "#282b3a"
+textColor = "#dcdfeb"
+borderColor = "#343849"
+dataframeHeaderBackgroundColor = "#24273a"
+chartCategoricalColors = ["#7fa6e3", "#f2a07b", "#6fc4a1", "#f0c75e", "#eb9cc0", "#9cc47a", "#a99be3", "#e98b8b"]
+
+[theme.dark.sidebar]
+backgroundColor = "#191b26"
+secondaryBackgroundColor = "#252838"
 
 [client]
 toolbarMode = "minimal"
