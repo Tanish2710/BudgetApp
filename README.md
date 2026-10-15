@@ -15,6 +15,8 @@ Personal budgeting and shared expenses in one Streamlit app: track spending agai
 - **Settle up**: net balances, the fewest payments needed within each circle, one-click payment recording, a payment-flow diagram and a payment history.
 - **Reminders**: one consolidated email per person who owes money, covering every circle, with the items, payments already made, balance due and exactly whom to pay.
 
+**Light and dark mode**: a *Dark mode* switch at the bottom of the sidebar. The app starts in light mode and each browser remembers its choice. Both palettes live in `.streamlit/config.toml` (`[theme.light]`, `[theme.dark]`), with matching CSS tokens in `app.py` and chart colours in `charts.py`.
+
 ## Automatic reminders
 
 Configure everything on the **Reminders** page:

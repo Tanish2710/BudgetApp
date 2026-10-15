@@ -8,6 +8,7 @@ import calendar
 from datetime import date, datetime
 
 import plotly.graph_objects as go
+import plotly.io as pio
 
 # --- Tokens (keep in sync with the CSS tokens in app.py) ---
 FONT = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
@@ -30,6 +31,19 @@ POSITIVE = "#7fa6e3"  # diverging pair: blue (money in / owed to you) ...
 NEGATIVE = "#e98b8b"  # ... red (money out / you owe)
 
 PLOTLY_CONFIG = {"displayModeBar": False, "responsive": True}
+
+# Dark-mode stand-ins for the neutral tokens above (keep in sync with TOKENS in app.py).
+# Series and status colours are pastel already and read well on both backgrounds.
+DARK_SWAPS = {
+    SURFACE: "#232636",
+    INK: "#e3e5f0",
+    INK_2: "#b3b7ca",
+    MUTED: "#8c91a8",
+    GRID: "#2e3244",
+    BASELINE: "#4a4f66",
+    OTHER: "#565b72",
+    "#e0e2ea": "#3a3e52",  # hover-label border
+}
 
 
 def money(v, curr, decimals=0):
@@ -318,3 +332,11 @@ def outstanding_by_age(queue, curr):
     _layout(fig, 240, curr, legend=False)
     fig.update_yaxes(range=[0, max(sums + [1]) * 1.25])
     return fig
+
+
+def to_dark(fig):
+    """Return a copy of a figure with its neutral (ink, grid, surface) colours swapped for dark mode."""
+    spec = fig.to_json()
+    for light, dark in DARK_SWAPS.items():
+        spec = spec.replace(f'"{light}"', f'"{dark}"').replace(f'"{light.upper()}"', f'"{dark}"')
+    return pio.from_json(spec)
