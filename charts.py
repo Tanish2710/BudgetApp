@@ -1,34 +1,49 @@
 """
 charts.py - Plotly figure builders sharing one visual system.
 
-Thin marks, hairline grids, a fixed categorical order (validated for colour-vision
-deficiency), status colours reserved for good/bad meaning, and one y-axis per chart.
+Thin marks, hairline grids, a fixed pastel categorical order,
+status colours reserved for good/bad meaning, and one y-axis per chart.
 """
 import calendar
 from datetime import date, datetime
 
 import plotly.graph_objects as go
+import plotly.io as pio
 
 # --- Tokens (keep in sync with the CSS tokens in app.py) ---
 FONT = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-SURFACE = "#ffffff"
-INK = "#0b0b0b"
-INK_2 = "#52514e"
-MUTED = "#898781"
-GRID = "#ecebe6"
-BASELINE = "#c3c2b7"
+SURFACE = "#fcfcfe"
+INK = "#2b2d42"
+INK_2 = "#565a6e"
+MUTED = "#80849a"
+GRID = "#eceef4"
+BASELINE = "#c9ccd8"
 
-# Categorical slots, assigned in this order and never cycled.
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
-OTHER = "#b9b8b1"
-BLUE_RAMP = {250: "#86b6ef", 350: "#5598e7", 450: "#2a78d6", 550: "#1c5cab", 650: "#104281"}
+# Categorical slots, assigned in this order and never cycled. Soft pastels that stay
+# distinct from one another (blue, peach, mint, butter, pink, sage, lavender, coral).
+SERIES = ["#7fa6e3", "#f2a07b", "#6fc4a1", "#f0c75e", "#eb9cc0", "#9cc47a", "#a99be3", "#e98b8b"]
+OTHER = "#cfd1da"
+BLUE_RAMP = {250: "#c3d5f3", 350: "#9fbbea", 450: "#7fa6e3", 550: "#5b7fcf", 650: "#42609f"}
 
-GOOD = "#0ca30c"
-CRITICAL = "#d03b3b"
-POSITIVE = "#2a78d6"  # diverging pair: blue (money in / owed to you) ...
-NEGATIVE = "#e34948"  # ... red (money out / you owe)
+GOOD = "#5fb88a"
+CRITICAL = "#e07a78"
+POSITIVE = "#7fa6e3"  # diverging pair: blue (money in / owed to you) ...
+NEGATIVE = "#e98b8b"  # ... red (money out / you owe)
 
 PLOTLY_CONFIG = {"displayModeBar": False, "responsive": True}
+
+# Dark-mode stand-ins for the neutral tokens above (keep in sync with TOKENS in app.py).
+# Series and status colours are pastel already and read well on both backgrounds.
+DARK_SWAPS = {
+    SURFACE: "#232636",
+    INK: "#e3e5f0",
+    INK_2: "#b3b7ca",
+    MUTED: "#8c91a8",
+    GRID: "#2e3244",
+    BASELINE: "#4a4f66",
+    OTHER: "#565b72",
+    "#e0e2ea": "#3a3e52",  # hover-label border
+}
 
 
 def money(v, curr, decimals=0):
@@ -44,7 +59,7 @@ def _layout(fig, height, curr=None, legend=True, hovermode="closest"):
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         hovermode=hovermode,
-        hoverlabel=dict(bgcolor=SURFACE, bordercolor="#dddcd6", font=dict(family=FONT, size=12, color=INK)),
+        hoverlabel=dict(bgcolor=SURFACE, bordercolor="#e0e2ea", font=dict(family=FONT, size=12, color=INK)),
         showlegend=legend,
         legend=dict(orientation="h", x=0, xanchor="left", y=1.02, yanchor="bottom",
                     font=dict(size=12, color=INK_2), bgcolor="rgba(0,0,0,0)", itemclick=False,
@@ -99,7 +114,7 @@ def spending_pace(daily_rows, month, budget, curr, projected=None):
     fig.add_trace(go.Scatter(
         x=days, y=cumulative, mode="lines", name="Spent so far",
         line=dict(color=SERIES[0], width=2, shape="hv"),
-        fill="tozeroy", fillcolor="rgba(42,120,214,0.08)",
+        fill="tozeroy", fillcolor="rgba(127,166,227,0.14)",
         customdata=[by_day.get(d, 0.0) for d in days],
         hovertemplate=(f"Day %{{x}}<br>Spent to date <b>{curr}%{{y:,.0f}}</b>"
                        f"<br>That day {curr}%{{customdata:,.0f}}<extra></extra>"),
@@ -284,13 +299,13 @@ def debt_flow(plan, curr):
                   color=[NEGATIVE] * len(payers) + [POSITIVE] * len(payees),
                   hovertemplate=f"%{{label}}<br>{curr}%{{value:,.2f}}<extra></extra>"),
         link=dict(source=[idx_src[f] for f, _ in pairs], target=[idx_dst[t] for _, t in pairs],
-                  value=[round(v, 2) for v in pairs.values()], color="rgba(42,120,214,0.16)",
+                  value=[round(v, 2) for v in pairs.values()], color="rgba(127,166,227,0.22)",
                   customdata=[f"{f} pays {t} {money(v, curr, 2)}" for (f, t), v in pairs.items()],
                   hovertemplate="%{customdata}<extra></extra>"),
     ))
     fig.update_layout(height=max(200, 52 * max(len(payers), len(payees)) + 40), margin=dict(t=8, b=8, l=8, r=8),
                       font=dict(family=FONT, size=12, color=INK), paper_bgcolor="rgba(0,0,0,0)",
-                      hoverlabel=dict(bgcolor=SURFACE, bordercolor="#dddcd6", font=dict(family=FONT, color=INK)))
+                      hoverlabel=dict(bgcolor=SURFACE, bordercolor="#e0e2ea", font=dict(family=FONT, color=INK)))
     return fig
 
 
@@ -317,3 +332,11 @@ def outstanding_by_age(queue, curr):
     _layout(fig, 240, curr, legend=False)
     fig.update_yaxes(range=[0, max(sums + [1]) * 1.25])
     return fig
+
+
+def to_dark(fig):
+    """Return a copy of a figure with its neutral (ink, grid, surface) colours swapped for dark mode."""
+    spec = fig.to_json()
+    for light, dark in DARK_SWAPS.items():
+        spec = spec.replace(f'"{light}"', f'"{dark}"').replace(f'"{light.upper()}"', f'"{dark}"')
+    return pio.from_json(spec)
