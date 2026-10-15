@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
+# Start the Smart Budgeter app. Set PYTHON to use a specific interpreter.
 cd "$(dirname "$0")"
-exec /home/tanishagrawal/.local/bin/python3.11 -m streamlit run app.py --server.headless true "$@"
+PYTHON="${PYTHON:-$(command -v python3.11 || command -v python3)}"
+exec "$PYTHON" -m streamlit run app.py --server.headless true "$@"

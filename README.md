@@ -1,50 +1,81 @@
-# Smart Budgeter ✦ Debt-Splitter Pro
+# Smart Budgeter
 
-An executive personal finance command center and Splitwise-style group debt-splitting ecosystem. Log personal expenses and incomes, establish category-level budgets with live pacing analysis, split group bills across 4 flexible modes, simplify multi-party debts with greedy algorithms, settle up with 1-click flows, and dispatch automated payment reminder statements via Email.
+Personal budgeting and shared expenses in one Streamlit app: track spending against a monthly budget and category limits, see trends over time, split bills with flatmates or on trips, settle up with the fewest payments, and email payment reminders automatically.
 
----
+## Features
 
-## 🚀 Key Improvements & Features
+**Personal**
+- **Overview**: this month's spending, cash flow, a daily allowance that keeps you within budget, and your shared balance. Charts show cumulative spending against an even budget pace (with a month-end projection) and spending by category against limits.
+- **Transactions**: add expenses and income; search, filter by category and period, edit or delete any record; export to CSV.
+- **Budgets**: a monthly budget plus per-category limits, viewable for any past month.
+- **Reports**: income vs spending, net savings and spending mix by month, with a table view.
 
-### 1. Modern Financial Design System
-- **Executive KPI Cards**: Real-time monthly spend, net cash flow, savings rate, daily safe spend pacing, and circle split position.
-- **Rupees (₹) Default & Three-Dots (⋮) Settings**: Currency defaults to Indian Rupees (`₹`). Currency preference, profile editing, and database actions are cleanly housed in a floating three-dots (`⋮`) popover menu in the top navigation bar.
+**Shared**
+- **Circles**: groups of people who share bills. Split a bill equally, by exact amounts, by percentages or by shares; amounts are allocated to the cent so they always add up to the total.
+- **Settle up**: net balances, the fewest payments needed within each circle, one-click payment recording, a payment-flow diagram and a payment history.
+- **Reminders**: one consolidated email per person who owes money, covering every circle, with the items, payments already made, balance due and exactly whom to pay.
 
-### 2. Personal Budgeting & Cash Flow Tracking
-- **Income & Cash Flow Engine**: Track multiple income streams (Salary, Freelance, Investments) and monitor Net Cash Flow (`Income - Expense`) and Savings Rate %.
-- **Daily Budget Pacing & Health**: Live calculation of daily burn rate, remaining days in month, and safe spending allowance per day to prevent month-end budget deficits.
-- **Category-Level Budgets**: Allocate explicit monthly spending caps per category (Dining, Rent, Utilities, Groceries, Entertainment) with progress bars and color-coded threshold alerts.
-- **Ledger Search & Filters**: Search transactions by keyword, filter by category/user/date range, and export to CSV.
+## Automatic reminders
 
-### 3. Splitwise-Style Shared Expenses & Debt Engine
-- **4 Flexible Splitting Modes**:
-  1. **Equal Split (=)**: Auto-divides bill evenly with exact penny remainder handling.
-  2. **Exact Dollar Amounts ($)**: Custom per-person dollar amounts with live mathematical balance validation.
-  3. **Percentage Split (%)**: Custom percentage allocation with 100% total validation.
-  4. **Shares / Parts (x)**: Weighted splitting (e.g. 2 shares vs 1 share).
-- **Circle & Group Management**: Create circles (Roommates, Trip Squad), add/remove members, and manage shared bill history.
-- **Split Toggles**: Toggle individual splits between "Paid" and "Unpaid" with instant balance recalibration.
+Configure everything on the **Reminders** page:
 
-### 4. Greedy Debt Simplification & 1-Click Settle
-- **Minimal Transaction Settlement**: Reduces $N$ circular group debts to the minimum direct transactions required using greedy matching between largest debtors and largest creditors.
-- **Directional Sankey Flow Graph**: Plotly Sankey diagram illustrating directional debt flows between circle members.
-- **⚡ 1-Click "Settle Up"**: Click "Settle Up" on any debt card to instantly pre-fill payer, receiver, amount, and notes in the settlement form.
-- **Payment Method Tracking**: Record repayments via Cash, Venmo, UPI, Bank Transfer, Zelle, or PayPal.
+| Setting | Meaning |
+|---|---|
+| Send automatically | Run once a day at the chosen hour |
+| Oldest item at least (days) | Only remind once the oldest unpaid item is this old |
+| Wait between reminders (days) | Never email the same person more often than this |
+| Skip balances under | Ignore trivial amounts |
+| Send real emails | Off = dry run: emails are rendered and logged, not sent |
 
-### 5. Automated Email Reminders & Statements Engine
-- **Dedicated Email Delivery**: Send formal payment statements and gentle payment reminders via email (SMTP) to delinquent debtors.
-- **HTML & Plain-Text Statement Templates**: Responsive, professional financial statements featuring item details, original payer, debt share, and settlement instructions.
-- **In-App Preview & 1-Click Send**: Preview the rendered HTML email statement before sending, with 1-click dispatch per split or bulk dispatch across all overdue debts.
-- **Dry-Run Safe Mode**: Default simulation mode verifies recipient emails, templates, and triggers without sending live messages.
-- **Interactive SMTP Config & Connection Test**: Enter and test SMTP credentials (e.g. Gmail App Passwords) directly in the UI.
-- **Headless CLI & Cron Automation**: Standalone `reminders.py --live` for scheduled daily reminder dispatching.
+Balances account for recorded payments and shares marked paid, so people who have paid stop receiving reminders. Every attempt (sent, simulated, failed) is logged in the History tab.
 
----
+The schedule runs inside the app process while it is running. To run it when the app is closed, call the CLI from cron. It reads the same settings and claims each day's run atomically, so the app and cron never double-send:
 
-## 🛠️ Database Schema (SQLite)
+```bash
+# Check hourly; the run happens once per day after the configured send hour
+5 * * * * cd /path/to/BudgetApp && python3 reminders.py --auto >> reminders.log 2>&1
+```
+
+Other CLI commands:
+
+```bash
+python3 reminders.py --summary            # who owes what and who is due
+python3 reminders.py --run-now            # send to everyone due now (uses the saved live/dry-run mode)
+python3 reminders.py --run-now --dry-run  # force a dry run
+```
+
+### Email (SMTP)
+
+Enter SMTP details under **Reminders → Email delivery** (for Gmail: `smtp.gmail.com`, port `587`, and an [app password](https://support.google.com/accounts/answer/185833)). Port 465 uses implicit SSL; other ports use STARTTLS. Settings are stored in the local database; any field left blank falls back to these environment variables:
+
+```bash
+export SMTP_HOST="smtp.gmail.com" SMTP_PORT="587"
+export SMTP_USER="you@gmail.com" SMTP_PASS="your-app-password" FROM_EMAIL="you@gmail.com"
+```
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+./run.sh            # or: python3 -m streamlit run app.py
+```
+
+On first launch you can create your profile or load six months of sample data. The SQLite database lives at `data/finance.db` (override with `BUDGET_DB_PATH`).
+
+## Project layout
+
+| File | Purpose |
+|---|---|
+| `app.py` | Streamlit UI (multi-page navigation) |
+| `charts.py` | Plotly chart builders sharing one visual style and colour palette |
+| `logic.py` | Balances, debt simplification, budget pacing, reminder statements |
+| `reminders.py` | Email rendering and delivery, reminder queue, daily scheduler, CLI |
+| `database.py` | SQLite schema, migrations, CRUD and sample data |
+
+## Database schema
 
 ```sql
-users(user_id, name, email, monthly_budget, created_at)
+users(user_id, name, email, phone, monthly_budget, created_at)
 expenses(exp_id, user_id, amount, category, description, date, payment_method, notes)
 incomes(income_id, user_id, amount, source, description, date)
 category_budgets(budget_id, user_id, category, monthly_limit)
@@ -53,54 +84,8 @@ group_members(group_id, user_id, joined_at)
 shared_expenses(shared_id, group_id, payer_id, amount, description, category, date)
 splits(split_id, shared_id, user_id, amount_owed, is_paid)
 settlements(settlement_id, from_user, to_user, amount, group_id, date, note, payment_method)
+reminder_log(log_id, user_id, group_id, amount, recipient, subject, status, trigger, message, created_at)
+app_settings(key, value)
 ```
 
-Indexes on `expenses(user_id, date)`, `incomes(user_id, date)`, `shared_expenses(group_id)`, `splits(user_id)`. Foreign keys enforced with cascading deletes.
-
----
-
-## 💻 Setup & Running
-
-```bash
-# 1. Install dependencies
-/home/tanishagrawal/.local/bin/python3.11 -m pip install -r requirements.txt
-
-# 2. Initialize database & seed demo data
-/home/tanishagrawal/.local/bin/python3.11 database.py
-
-# 3. Launch the Streamlit application
-./run.sh
-# or:
-/home/tanishagrawal/.local/bin/python3.11 -m streamlit run app.py
-```
-
----
-
-## 🔔 Automation Setup (Reminders CLI)
-
-```bash
-# Print summary of pending and overdue splits:
-python reminders.py --summary
-
-# Simulate dispatch (Dry-run mode):
-python reminders.py --overdue-days 3
-
-# Send live emails & Discord notifications:
-export SMTP_HOST="smtp.gmail.com"
-export SMTP_PORT="587"
-export SMTP_USER="you@gmail.com"
-export SMTP_PASS="your-app-password"
-export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-
-python reminders.py --live --overdue-days 3
-
-# Cron setup: Run daily at 9:00 AM
-# 0 9 * * * cd /home/tanishagrawal/BudgetApp && /home/tanishagrawal/.local/bin/python3.11 reminders.py --live >> reminders.log 2>&1
-```
-
----
-
-## 💼 Resume & Portfolio Highlights
-- **Engineered Full Financial Architecture**: Designed normalized SQLite schema with 9 tables, foreign key constraints, composite keys, and indexing.
-- **Greedy Optimization Algorithm**: Implemented minimal cash-flow debt simplification reducing $O(N^2)$ circular debts to minimal direct transfers.
-- **Automated Email Reminders & Statements Engine**: Created an automated email notification pipeline using Python's `smtplib` and `email` packages to render and dispatch professional multipart (HTML + plain text) financial statements with live and dry-run modes.
+Foreign keys are enforced with cascading deletes, and the hot query paths are indexed.

@@ -10,6 +10,9 @@ from datetime import datetime, date
 import calendar
 from database import get_db_connection
 
+# Categories paid once a month; excluded when extrapolating month-end spending.
+FIXED_MONTHLY_CATEGORIES = ("Housing & Rent",)
+
 def compute_balances(group_id=None):
     """
     Returns dict {user_id: net_balance} where positive = owed money (+), negative = owes money (-).
@@ -217,10 +220,20 @@ def get_budget_status(user_id, month=None):
     if month == cur_month_str:
         days_in_month = calendar.monthrange(now.year, now.month)[1]
         days_passed = max(1, now.day)
-        days_remaining = max(1, days_in_month - days_passed)
+        # Days left *including today*, so the allowance on the last day is the full remainder.
+        days_remaining = days_in_month - now.day + 1
         time_elapsed_pct = round((days_passed / days_in_month) * 100, 1)
         safe_daily_spend = round(max(0.0, remaining / days_remaining), 2)
-        projected_spend = round((spent / days_passed) * days_in_month, 2)
+        # Rent is a once-a-month cost, so only extrapolate the day-to-day spending.
+        conn = get_db_connection()
+        fixed = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE user_id = ? AND substr(date, 1, 7) = ? AND category IN (%s)"
+            % ",".join("?" * len(FIXED_MONTHLY_CATEGORIES)),
+            (user_id, month, *FIXED_MONTHLY_CATEGORIES),
+        ).fetchone()[0]
+        conn.close()
+        variable = spent - float(fixed)
+        projected_spend = round(float(fixed) + (variable / days_passed) * days_in_month, 2)
     else:
         parts = month.split("-")
         y, m = int(parts[0]), int(parts[1])
@@ -242,8 +255,8 @@ def get_budget_status(user_id, month=None):
         "time_elapsed_pct": time_elapsed_pct,
         "safe_daily_spend": safe_daily_spend,
         "projected_spend": projected_spend,
-        "is_over_budget": remaining < 0,
-        "is_pacing_fast": (pct > (time_elapsed_pct + 15)) if budget > 0 else False
+        "is_over_budget": budget > 0 and remaining < 0,
+        "is_pacing_fast": (projected_spend > budget) if budget > 0 else False
     }
 
 def get_category_budget_status(user_id, month=None):
@@ -351,12 +364,8 @@ def get_month_over_month_metrics(user_id):
         "income_change_pct": inc_change_pct
     }
 
-def get_sankey_debt_data(group_id=None, curr="₹", *args, **kwargs):
+def get_sankey_debt_data(group_id=None, curr="₹"):
     """Formats node and link dictionaries for Plotly Sankey diagram of simplified debts."""
-    if "curr" in kwargs:
-        curr = kwargs["curr"]
-    elif len(args) > 0:
-        curr = args[0]
     txns = get_who_owes_whom(group_id)
     if not txns:
         return None
@@ -374,17 +383,117 @@ def get_sankey_debt_data(group_id=None, curr="₹", *args, **kwargs):
     values = [t["amount"] for t in txns]
     labels = [f"{t['from_name']} owes {t['to_name']} {curr}{t['amount']:.2f}" for t in txns]
 
+    payers = {t["from_name"] for t in txns}
     return {
         "nodes": nodes,
+        "node_is_debtor": [n in payers for n in nodes],
         "sources": sources,
         "targets": targets,
         "values": values,
         "labels": labels
     }
 
+def get_settlement_plan(group_id=None):
+    """
+    Settlement transfers, always computed per circle so every recorded payment can be
+    attached to the circle it clears. With group_id=None every circle is included.
+    Each transfer dict carries group_id / group_name.
+    """
+    conn = get_db_connection()
+    if group_id is None:
+        groups = conn.execute("SELECT group_id, group_name FROM groups ORDER BY group_name").fetchall()
+    else:
+        groups = conn.execute("SELECT group_id, group_name FROM groups WHERE group_id = ?", (group_id,)).fetchall()
+    conn.close()
+    plan = []
+    for g in groups:
+        for t in get_who_owes_whom(g["group_id"]):
+            t["group_id"] = g["group_id"]
+            t["group_name"] = g["group_name"]
+            plan.append(t)
+    return plan
+
+def build_debtor_statements(group_id=None, today=None):
+    """
+    One consolidated statement per person who currently owes money, consistent with the
+    balance engine (unpaid splits, items marked paid and recorded settlements all count).
+
+    Returns a list of dicts sorted by amount owed (desc):
+      {user_id, name, email, total_owed, oldest_due, days_outstanding,
+       circles: [{group_id, group_name, owed, transfers:[{to_user,to_name,amount}],
+                  items:[unpaid split rows], charges, credits, outstanding_since}]}
+
+    `outstanding_since` applies credits (payments made, money owed back) to the oldest
+    unpaid items first, so a partly paid-off balance ages from the first item still open.
+    """
+    today = today or date.today()
+    conn = get_db_connection()
+    if group_id is None:
+        groups = conn.execute("SELECT group_id, group_name FROM groups ORDER BY group_name").fetchall()
+    else:
+        groups = conn.execute("SELECT group_id, group_name FROM groups WHERE group_id = ?", (group_id,)).fetchall()
+    users = {r["user_id"]: dict(r) for r in conn.execute("SELECT user_id, name, email FROM users").fetchall()}
+    conn.close()
+
+    statements = {}
+    for g in groups:
+        gid = g["group_id"]
+        balances = compute_balances(gid)
+        if not any(b < -0.01 for b in balances.values()):
+            continue
+        transfers = simplify_debts(balances)
+        unpaid = sorted(get_unpaid_splits(gid), key=lambda s: (s["date"], s["split_id"]))
+        for uid, bal in balances.items():
+            if bal >= -0.01 or uid not in users:
+                continue
+            owed = round(-bal, 2)
+            items = [s for s in unpaid if s["user_id"] == uid]
+            charges = round(sum(s["amount_owed"] for s in items), 2)
+            credits = round(max(0.0, charges - owed), 2)
+            outstanding_since = None
+            remaining_credit = credits
+            for s in items:
+                if remaining_credit + 0.005 >= s["amount_owed"]:
+                    remaining_credit -= s["amount_owed"]
+                    continue
+                outstanding_since = s["date"]
+                break
+            if outstanding_since is None:
+                outstanding_since = today.isoformat()
+
+            u = users[uid]
+            st = statements.setdefault(uid, {
+                "user_id": uid, "name": u["name"], "email": u.get("email") or "",
+                "total_owed": 0.0, "circles": [],
+            })
+            st["circles"].append({
+                "group_id": gid,
+                "group_name": g["group_name"],
+                "owed": owed,
+                "transfers": [
+                    {"to_user": c, "to_name": users.get(c, {}).get("name", f"User {c}"),
+                     "to_email": users.get(c, {}).get("email") or "", "amount": amt}
+                    for d, c, amt in transfers if d == uid
+                ],
+                "items": items,
+                "charges": charges,
+                "credits": credits,
+                "outstanding_since": outstanding_since,
+            })
+            st["total_owed"] = round(st["total_owed"] + owed, 2)
+
+    result = []
+    for st in statements.values():
+        oldest = min(c["outstanding_since"] for c in st["circles"])
+        st["oldest_due"] = oldest
+        st["days_outstanding"] = max(0, (today - date.fromisoformat(oldest[:10])).days)
+        result.append(st)
+    result.sort(key=lambda s: s["total_owed"], reverse=True)
+    return result
+
 def validate_user_data(name, email, phone, exclude_user_id=None):
     """
-    Validates name, email format & uniqueness, and 10-digit mobile number format & uniqueness.
+    Validates name, email format & uniqueness, and optional 10-digit mobile number format & uniqueness.
     Returns (is_valid: bool, error_msg: str or None, clean_email: str or None, clean_phone: str or None).
     """
     import re
@@ -392,12 +501,12 @@ def validate_user_data(name, email, phone, exclude_user_id=None):
 
     name_str = str(name).strip() if name else ""
     if not name_str:
-        return False, "Full Name is required.", None, None
+        return False, "Name is required.", None, None
 
     # Validate Email
     email_str = str(email).strip() if email else ""
     if not email_str:
-        return False, "Email address is required.", None, None
+        return False, "Email address is required (it's used for payment reminders).", None, None
 
     email_regex = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
     if not re.match(email_regex, email_str):
@@ -408,21 +517,21 @@ def validate_user_data(name, email, phone, exclude_user_id=None):
     # Check Email Uniqueness in Database
     existing_user_email = db.get_user_by_email(clean_email)
     if existing_user_email and (exclude_user_id is None or existing_user_email["user_id"] != exclude_user_id):
-        return False, f"Email '{clean_email}' is already registered to user '{existing_user_email['name']}'. Please use a unique email address.", None, None
+        return False, f"Email '{clean_email}' is already registered to '{existing_user_email['name']}'.", None, None
 
-    # Validate 10-Digit Mobile Number
+    # Mobile number is optional; when given it must be 10 digits (spaces/dashes allowed)
     phone_str = str(phone).strip() if phone else ""
-    if not phone_str:
-        return False, "10-digit mobile number is required.", None, None
+    clean_phone = None
+    if phone_str:
+        if any(ch not in "0123456789 -" for ch in phone_str):
+            return False, f"Mobile number may only contain digits, spaces or dashes (entered: '{phone_str}').", None, None
+        clean_phone = "".join(filter(str.isdigit, phone_str))
+        if len(clean_phone) != 10:
+            return False, f"Mobile number must have exactly 10 digits (entered: '{phone_str}').", None, None
 
-    clean_phone = "".join(filter(str.isdigit, phone_str))
-    if len(clean_phone) != 10 or not phone_str.isdigit():
-        return False, f"Mobile number must be exactly 10 digits (0-9) without spaces or country code (entered: '{phone_str}').", None, None
-
-    # Check Phone Uniqueness in Database
-    existing_user_phone = db.get_user_by_phone(clean_phone)
-    if existing_user_phone and (exclude_user_id is None or existing_user_phone["user_id"] != exclude_user_id):
-        return False, f"Mobile number '{clean_phone}' is already registered to user '{existing_user_phone['name']}'. Please use a unique mobile number.", None, None
+        existing_user_phone = db.get_user_by_phone(clean_phone)
+        if existing_user_phone and (exclude_user_id is None or existing_user_phone["user_id"] != exclude_user_id):
+            return False, f"Mobile number '{clean_phone}' is already registered to '{existing_user_phone['name']}'.", None, None
 
     return True, None, clean_email, clean_phone
 
