@@ -38,6 +38,11 @@ chartCategoricalColors = ["#7fa6e3", "#f2a07b", "#6fc4a1", "#f0c75e", "#eb9cc0",
 backgroundColor = "#191b26"
 secondaryBackgroundColor = "#252838"
 
+[runner]
+# By default Streamlit forces a full garbage collection after every rerun. With pandas and
+# Plotly loaded that pause holds up the end of every click; Python's own collector still runs.
+postScriptGC = false
+
 [client]
 toolbarMode = "auto"
 showErrorDetails = true

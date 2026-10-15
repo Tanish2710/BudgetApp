@@ -4,6 +4,7 @@ app.py - Smart Budgeter
 Personal budgeting (expenses, income, monthly and category budgets, reports) and
 shared expenses (circles, bill splitting, settle-up suggestions, payment reminders).
 """
+import functools
 import html
 import os
 import sys
@@ -96,6 +97,23 @@ def _theme_sync_script(dark, switching, profile_id=None, run=0):
     const rgb = app ? getComputedStyle(app).backgroundColor.match(/\\d+/g) : null;
     return rgb ? ((0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) < 128 ? "Dark" : "Light") : null;
   }};
+  // Reload as soon as the sidebar switch is clicked, instead of waiting for Python to rerun
+  // the page in the old theme first. The Python path below remains for keyboard toggles.
+  window.__sbSwitchTo = (mode) => {{
+    setCookie(mode);
+    window.localStorage.setItem(key, JSON.stringify(mode));
+    reload();
+  }};
+  window.__sbWant = want;
+  if (!window.__sbFastSwitch) {{
+    window.__sbFastSwitch = true;
+    document.addEventListener("click", (e) => {{
+      const label = e.target.closest('[data-testid="stSidebar"] label');
+      if (label && label.textContent.trim() === "Dark mode") {{
+        window.__sbSwitchTo(window.__sbWant === "Dark" ? "Light" : "Dark");
+      }}
+    }}, true);
+  }}
   const painted = paintedMode();
   let stored = null;
   try {{ stored = JSON.parse(window.localStorage.getItem(key)); }} catch (e) {{}}
@@ -146,6 +164,10 @@ st.markdown("""
 
   /* Bordered containers read as white cards on the off-white page */
   [data-testid="stLayoutWrapper"] > [data-testid="stVerticalBlock"] { background: var(--surface); }
+  /* ...but not the plain container each fragment() renders into (see fragment() below) */
+  [data-testid="stLayoutWrapper"] > [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .sb-fragment) {
+    background: transparent; }
+  [data-testid="stElementContainer"]:has(.sb-fragment) { display: none; }
 
   .page-head { margin: 0 0 1.25rem 0; }
   .page-head h1 { font-size: 1.55rem; font-weight: 700; margin: 0; padding: 0; color: var(--ink); }
@@ -259,10 +281,33 @@ def empty_state(title, body=""):
     st.markdown(f"<div class='empty'><b>{esc(title)}</b>{esc(body)}</div>", unsafe_allow_html=True)
 
 
-def plot(fig):
-    if DARK:
-        fig = charts.to_dark(fig)
-    st.plotly_chart(fig, width="stretch", config=charts.PLOTLY_CONFIG)
+@st.cache_resource(max_entries=256, show_spinner=False)
+def _figure(builder, dark, day, *args, **kwargs):
+    """Build a chart once per distinct input. Plotly validates every property it is given,
+    which makes building a figure cost far more than drawing it, so reruns that show the
+    same numbers (switching pages, toggling a control) reuse the finished figure.
+    `day` is part of the key because some charts mark today or the current month."""
+    fig = getattr(charts, builder)(*args, **kwargs)
+    return charts.to_dark(fig) if dark else fig
+
+
+def plot(builder, *args, **kwargs):
+    """Draw charts.<builder>(*args, **kwargs) in the active theme."""
+    st.plotly_chart(_figure(builder, DARK, date.today(), *args, **kwargs), width="stretch",
+                    config=charts.PLOTLY_CONFIG)
+
+
+def fragment(fn):
+    """st.fragment: a control inside reruns only this function, not the whole app.
+
+    Streamlit draws a fragment inside a plain container, which the card style above would
+    paint white, so each fragment starts with a hidden marker that the CSS uses to skip it.
+    """
+    @functools.wraps(fn)
+    def body(*args, **kwargs):
+        st.html("<span class='sb-fragment'></span>")
+        return fn(*args, **kwargs)
+    return st.fragment(body)
 
 
 def ensure_choice(key, options, default=None):
@@ -428,14 +473,14 @@ def page_overview():
             section("Spending this month", "Cumulative spending against an even pace to your monthly budget.")
             daily = db.get_daily_spending(ACTIVE_ID, cur_month)
             if daily:
-                plot(charts.spending_pace(daily, cur_month, bs["budget"], CURR, bs["projected_spend"]))
+                plot("spending_pace", daily, cur_month, bs["budget"], CURR, bs["projected_spend"])
             else:
                 empty_state("No spending yet this month", "")
     with right:
         with st.container(border=True):
             section("By category", "Bars show spending; ticks mark your limits.")
             if any(c["spent"] > 0 for c in cat_status):
-                plot(charts.category_vs_budget(cat_status, CURR, max_rows=7))
+                plot("category_vs_budget", cat_status, CURR, max_rows=7)
             else:
                 empty_state("Nothing to show yet", "")
             st.page_link(PAGE_BUDGETS, label="Manage budgets", icon=":material/arrow_forward:")
@@ -496,7 +541,15 @@ PERIODS = {
 
 def page_transactions():
     page_header("Transactions", f"Record and review spending and income for {ACTIVE['name']}.")
+    _add_transaction()
+    st.write("")
+    _ledger()
 
+
+# The add form and the history list are fragments: switching Expense/Income, filtering or
+# selecting a row reruns only that part. Saving still reruns the whole app (st.rerun()).
+@fragment
+def _add_transaction():
     with st.container(border=True):
         kind = st.segmented_control("Add", ["Expense", "Income"], default="Expense", key="add_kind") or "Expense"
         if kind == "Expense":
@@ -533,7 +586,9 @@ def page_transactions():
                         flash(f"Added income of {fmt(amt)}")
                         st.rerun()
 
-    st.write("")
+
+@fragment
+def _ledger():
     section("History")
     f1, f2, f3, f4 = st.columns([1.1, 2, 1.4, 1.3])
     view = f1.segmented_control("Show", ["Expenses", "Income"], default="Expenses", key="ledger_view") or "Expenses"
@@ -580,7 +635,7 @@ def page_transactions():
     c_dl, _ = st.columns([1, 4])
     c_dl.download_button("Download CSV", data=df.to_csv(index=False).encode("utf-8"),
                          file_name=f"{view.lower()}_{period.lower().replace(' ', '_')}.csv", mime="text/csv",
-                         icon=":material/download:")
+                         icon=":material/download:", on_click="ignore")
 
     sel = event.selection.rows if event and event.selection else []
     if not sel:
@@ -669,7 +724,7 @@ def page_budgets():
         with st.container(border=True):
             section("Spending by category", f"{month_label(month)}. Bars turn red once a category passes its limit.")
             if cat_status:
-                plot(charts.category_vs_budget(cat_status, CURR, max_rows=12))
+                plot("category_vs_budget", cat_status, CURR, max_rows=12)
             else:
                 empty_state("No spending recorded for this month", "")
     with right:
@@ -778,17 +833,17 @@ def page_reports():
     with left:
         with st.container(border=True):
             section("Income and spending", "Monthly totals.")
-            plot(charts.income_vs_expenses(merged, CURR))
+            plot("income_vs_expenses", merged, CURR)
     with right:
         with st.container(border=True):
             section("Net savings", "Income minus spending each month.")
-            plot(charts.net_savings(merged, CURR))
+            plot("net_savings", merged, CURR)
 
     with st.container(border=True):
         section("Spending mix", "Your five largest categories; everything else is grouped as Other.")
         cat_rows = [r for r in db.get_monthly_category_spending(ACTIVE_ID) if r["month"] >= months[0]]
         if cat_rows:
-            plot(charts.category_trend(cat_rows, CURR))
+            plot("category_trend", cat_rows, CURR)
         with st.expander("Table view"):
             table = merged.copy()
             table["Net"] = table["Income"] - table["Expenses"]
@@ -870,49 +925,7 @@ def page_circles():
     t_bills, t_add, t_members = st.tabs(["Bills", "Add a bill", "Members & settings"])
 
     with t_bills:
-        if not bills:
-            with st.container(border=True):
-                empty_state("No bills yet", "Add the first bill in the “Add a bill” tab.")
-        show_all = len(bills) <= 15 or st.toggle(f"Show all {len(bills)} bills", key=f"all_bills_{gid}")
-        for b in (bills if show_all else bills[:15]):
-            splits = db.get_splits_for_expense(b["shared_id"])
-            owing = [s for s in splits if s["user_id"] != b["payer_id"]]
-            paid_n = sum(1 for s in owing if s["is_paid"])
-            with st.container(border=True):
-                h1, h2 = st.columns([4, 1], vertical_alignment="center")
-                with h1:
-                    status = chip("Settled", "pos") if owing and paid_n == len(owing) else chip(f"{paid_n}/{len(owing)} paid")
-                    st.markdown(f"<div class='row-main'>{esc(b['description'])} &nbsp;{status}</div>"
-                                f"<div class='row-meta'>{nice_date(b['date'])} &middot; paid by {esc(b['payer_name'])} &middot; {esc(b.get('category') or 'General')}</div>",
-                                unsafe_allow_html=True)
-                with h2:
-                    st.markdown(f"<div class='row-amt' style='text-align:right;font-size:1rem'>{fmt(b['amount'])}</div>",
-                                unsafe_allow_html=True)
-                with st.expander("Split details"):
-                    for s in splits:
-                        r1, r2, r3 = st.columns([3, 1.2, 1.2], vertical_alignment="center")
-                        r1.markdown(f"<div class='row-main' style='font-weight:400'>{esc(s['user_name'])}</div>", unsafe_allow_html=True)
-                        r2.markdown(f"<div class='row-amt'>{fmt(s['amount_owed'])}</div>", unsafe_allow_html=True)
-                        with r3:
-                            if s["user_id"] == b["payer_id"]:
-                                st.markdown(chip("Paid the bill", "blue"), unsafe_allow_html=True)
-                            elif s["is_paid"]:
-                                if st.button("Mark unpaid", key=f"unpaid_{s['split_id']}", type="tertiary"):
-                                    db.mark_split_paid(s["split_id"], False)
-                                    st.rerun()
-                            else:
-                                if st.button("Mark paid", key=f"paid_{s['split_id']}"):
-                                    db.mark_split_paid(s["split_id"], True)
-                                    flash(f"{s['user_name']}'s share marked as paid")
-                                    st.rerun()
-                    st.caption("Mark a share as paid when it was paid back directly for this bill. "
-                               "For lump-sum payments use Settle up instead (don't do both for the same money).")
-                    with st.popover("Delete bill", icon=":material/delete:"):
-                        st.write(f"Delete **{b['description']}** and all its splits?")
-                        if st.button("Delete", type="primary", key=f"del_bill_{b['shared_id']}"):
-                            db.delete_shared_expense(b["shared_id"])
-                            flash("Bill deleted", ":material/delete:")
-                            st.rerun()
+        _bill_list(gid, bills)
 
     with t_add:
         if not members:
@@ -925,6 +938,57 @@ def page_circles():
         _circle_settings(gid, members, balances)
 
 
+@fragment
+def _bill_list(gid, bills):
+    if not bills:
+        with st.container(border=True):
+            empty_state("No bills yet", "Add the first bill in the “Add a bill” tab.")
+    show_all = len(bills) <= 15 or st.toggle(f"Show all {len(bills)} bills", key=f"all_bills_{gid}")
+    splits_by_bill = {}
+    for s in db.get_all_splits_for_group(gid):
+        splits_by_bill.setdefault(s["shared_id"], []).append(s)
+    for b in (bills if show_all else bills[:15]):
+        splits = sorted(splits_by_bill.get(b["shared_id"], []), key=lambda s: s["debtor_name"])
+        owing = [s for s in splits if s["user_id"] != b["payer_id"]]
+        paid_n = sum(1 for s in owing if s["is_paid"])
+        with st.container(border=True):
+            h1, h2 = st.columns([4, 1], vertical_alignment="center")
+            with h1:
+                status = chip("Settled", "pos") if owing and paid_n == len(owing) else chip(f"{paid_n}/{len(owing)} paid")
+                st.markdown(f"<div class='row-main'>{esc(b['description'])} &nbsp;{status}</div>"
+                            f"<div class='row-meta'>{nice_date(b['date'])} &middot; paid by {esc(b['payer_name'])} &middot; {esc(b.get('category') or 'General')}</div>",
+                            unsafe_allow_html=True)
+            with h2:
+                st.markdown(f"<div class='row-amt' style='text-align:right;font-size:1rem'>{fmt(b['amount'])}</div>",
+                            unsafe_allow_html=True)
+            with st.expander("Split details"):
+                for s in splits:
+                    r1, r2, r3 = st.columns([3, 1.2, 1.2], vertical_alignment="center")
+                    r1.markdown(f"<div class='row-main' style='font-weight:400'>{esc(s['debtor_name'])}</div>", unsafe_allow_html=True)
+                    r2.markdown(f"<div class='row-amt'>{fmt(s['amount_owed'])}</div>", unsafe_allow_html=True)
+                    with r3:
+                        if s["user_id"] == b["payer_id"]:
+                            st.markdown(chip("Paid the bill", "blue"), unsafe_allow_html=True)
+                        elif s["is_paid"]:
+                            if st.button("Mark unpaid", key=f"unpaid_{s['split_id']}", type="tertiary"):
+                                db.mark_split_paid(s["split_id"], False)
+                                st.rerun()
+                        else:
+                            if st.button("Mark paid", key=f"paid_{s['split_id']}"):
+                                db.mark_split_paid(s["split_id"], True)
+                                flash(f"{s['debtor_name']}'s share marked as paid")
+                                st.rerun()
+                st.caption("Mark a share as paid when it was paid back directly for this bill. "
+                           "For lump-sum payments use Settle up instead (don't do both for the same money).")
+                with st.popover("Delete bill", icon=":material/delete:"):
+                    st.write(f"Delete **{b['description']}** and all its splits?")
+                    if st.button("Delete", type="primary", key=f"del_bill_{b['shared_id']}"):
+                        db.delete_shared_expense(b["shared_id"])
+                        flash("Bill deleted", ":material/delete:")
+                        st.rerun()
+
+
+@fragment
 def _bill_builder(gid, members):
     name = {m["user_id"]: m["name"] for m in members}
     ids = list(name)
@@ -1114,14 +1178,14 @@ def page_settle():
         with st.container(border=True):
             section("Net balances", "Blue is owed money, red owes money.")
             if bal_details:
-                plot(charts.net_balances(bal_details, CURR))
+                plot("net_balances", bal_details, CURR)
             else:
                 empty_state("No balances yet", "")
 
     if plan:
         with st.container(border=True):
             section("Payment flow", "Width shows how much each person pays.")
-            plot(charts.debt_flow(plan, CURR))
+            plot("debt_flow", plan, CURR)
 
     history = db.get_settlements(gid)
     with st.container(border=True):
@@ -1249,7 +1313,7 @@ def page_reminders():
             with st.container(border=True):
                 section("Outstanding by age", "Based on each person's oldest unpaid item.")
                 if queue:
-                    plot(charts.outstanding_by_age(queue, CURR))
+                    plot("outstanding_by_age", queue, CURR)
                 else:
                     empty_state("Nothing outstanding", "")
 
@@ -1442,7 +1506,8 @@ def page_settings():
                     section(title, f"{len(rows)} record(s), all people")
                     st.download_button("Download CSV", data=pd.DataFrame(rows).to_csv(index=False).encode("utf-8"),
                                        file_name=f"{slug}_{today.isoformat()}.csv", mime="text/csv",
-                                       disabled=not rows, width="stretch", key=f"dl_{slug}", icon=":material/download:")
+                                       disabled=not rows, width="stretch", key=f"dl_{slug}", icon=":material/download:",
+                                       on_click="ignore")
         with st.container(border=True):
             section("Reset", "Both actions replace everything in the database. Reminder and email settings are kept.")
             ok = st.checkbox("I understand all current data will be erased", key="reset_ok")
@@ -1461,14 +1526,17 @@ def page_settings():
 # ---------------------------------------------------------------------------
 # Navigation
 # ---------------------------------------------------------------------------
-PAGE_OVERVIEW = st.Page(page_overview, title="Overview", icon=":material/space_dashboard:", url_path="overview", default=True)
-PAGE_TRANSACTIONS = st.Page(page_transactions, title="Transactions", icon=":material/receipt_long:", url_path="transactions")
-PAGE_BUDGETS = st.Page(page_budgets, title="Budgets", icon=":material/savings:", url_path="budgets")
-PAGE_REPORTS = st.Page(page_reports, title="Reports", icon=":material/insights:", url_path="reports")
-PAGE_CIRCLES = st.Page(page_circles, title="Circles", icon=":material/group:", url_path="circles")
-PAGE_SETTLE = st.Page(page_settle, title="Settle up", icon=":material/handshake:", url_path="settle-up")
-PAGE_REMINDERS = st.Page(page_reminders, title="Reminders", icon=":material/notifications:", url_path="reminders")
-PAGE_SETTINGS = st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings")
+# Each page is a fragment, so a control on a page (a month picker, a tab's toggle, a table
+# selection) reruns just that page instead of the whole app with its sidebar. Anything that
+# writes data calls st.rerun(), which still refreshes the whole app.
+PAGE_OVERVIEW = st.Page(fragment(page_overview), title="Overview", icon=":material/space_dashboard:", url_path="overview", default=True)
+PAGE_TRANSACTIONS = st.Page(fragment(page_transactions), title="Transactions", icon=":material/receipt_long:", url_path="transactions")
+PAGE_BUDGETS = st.Page(fragment(page_budgets), title="Budgets", icon=":material/savings:", url_path="budgets")
+PAGE_REPORTS = st.Page(fragment(page_reports), title="Reports", icon=":material/insights:", url_path="reports")
+PAGE_CIRCLES = st.Page(fragment(page_circles), title="Circles", icon=":material/group:", url_path="circles")
+PAGE_SETTLE = st.Page(fragment(page_settle), title="Settle up", icon=":material/handshake:", url_path="settle-up")
+PAGE_REMINDERS = st.Page(fragment(page_reminders), title="Reminders", icon=":material/notifications:", url_path="reminders")
+PAGE_SETTINGS = st.Page(fragment(page_settings), title="Settings", icon=":material/settings:", url_path="settings")
 
 nav = st.navigation({
     "Personal": [PAGE_OVERVIEW, PAGE_TRANSACTIONS, PAGE_BUDGETS, PAGE_REPORTS],
