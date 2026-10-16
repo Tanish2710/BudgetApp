@@ -8,6 +8,7 @@ import functools
 import html
 import os
 import sys
+import zlib
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -322,6 +323,14 @@ def fragment(fn):
     return st.fragment(body)
 
 
+def rows_key(prefix, rows, id_key):
+    """Widget key for a selectable table. A selection is stored as row positions, so the key
+    changes whenever the rows or their order change (a filter, an added or deleted record);
+    otherwise the old selection would land on a different record, or past the end."""
+    ids = ",".join(str(r[id_key]) for r in rows)
+    return f"{prefix}_{zlib.crc32(ids.encode())}"
+
+
 def ensure_choice(key, options, default=None):
     """Drop a stale session value (e.g. a deleted person or circle) before rendering a widget."""
     if key in st.session_state and st.session_state[key] not in options:
@@ -370,10 +379,10 @@ def _reset_view_state():
 def current_account():
     uid = st.session_state.get("auth_uid")
     if uid:
-        acct = db.get_user(uid)
-        if acct and acct.get("password_hash") and acct.get("is_active"):
+        acct = auth.account_for_token(st.session_state.get("auth_token"))
+        if acct and acct["user_id"] == uid:
             return acct
-        _log_out()  # deactivated or deleted while logged in
+        _log_out()  # deactivated, deleted or signed out (e.g. a password reset) while logged in
         return None
     token = st.context.cookies.get(SESSION_COOKIE)
     acct = auth.account_for_token(token)
@@ -800,7 +809,7 @@ def _ledger():
                 unsafe_allow_html=True)
     event = st.dataframe(
         show, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(show)),
-        on_select="rerun", selection_mode="single-row", key=f"ledger_{view}",
+        on_select="rerun", selection_mode="single-row", key=rows_key(f"ledger_{view}", rows, id_key),
         column_config={"Date": st.column_config.DateColumn("Date", format="DD MMM YYYY"), "Amount": money_col("Amount")},
     )
     c_dl, _ = st.columns([1, 4])
@@ -809,7 +818,7 @@ def _ledger():
                          icon=":material/download:", on_click="ignore")
 
     sel = event.selection.rows if event and event.selection else []
-    if not sel:
+    if not sel or sel[0] >= len(rows):
         return
     rec = rows[sel[0]]
     rid = rec[id_key]
@@ -1043,7 +1052,8 @@ def _new_circle_form(key):
                 gid = db.create_group(name, owner_id=ACCOUNT_ID)
                 if include_me:
                     db.add_member_to_group(gid, ACTIVE_ID)
-                st.session_state["circle_id"] = gid
+                # The circle picker may already be on the page, so select the new circle on the next run.
+                st.session_state["_circle_pick"] = gid
                 flash(f"Created {name.strip()}")
                 st.rerun()
             except ValueError as e:
@@ -1062,6 +1072,8 @@ def page_circles():
 
     gids = [g["group_id"] for g in groups]
     mine = [g["group_id"] for g in db.get_user_groups(ACTIVE_ID) if g["group_id"] in group_map]
+    if st.session_state.get("_circle_pick") in gids:
+        st.session_state["circle_id"] = st.session_state.pop("_circle_pick")
     ensure_choice("circle_id", gids, default=mine[0] if mine else None)
     c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
     gid = c1.selectbox("Circle", gids, format_func=lambda i: group_map[i]["group_name"], key="circle_id")
@@ -1175,7 +1187,9 @@ def _bill_builder(gid, members):
         payer = c4.selectbox("Paid by", ids, format_func=name.get,
                              index=ids.index(ACTIVE_ID) if ACTIVE_ID in ids else 0, key=f"bb_payer_{gid}")
         category = c5.selectbox("Category", db.SHARED_CATEGORIES, key=f"bb_cat_{gid}")
-        parts = st.multiselect("Split between", ids, default=ids, format_func=name.get, key=f"bb_parts_{gid}")
+        # The member list is part of the key so a newly added member starts out included.
+        parts = st.multiselect("Split between", ids, default=ids, format_func=name.get,
+                               key=f"bb_parts_{gid}_{'-'.join(map(str, ids))}")
         mode = st.segmented_control("Split", ["Equally", "Exact amounts", "Percentages", "Shares"],
                                     default="Equally", key=f"bb_mode_{gid}") or "Equally"
         total = float(total or 0)
@@ -1390,10 +1404,10 @@ def page_settle():
             "Note": df["note"].fillna(""),
         })
         ev = st.dataframe(show, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
-                          key=f"settle_hist_{scope}", height=min(360, 38 + 35 * len(show)),
+                          key=rows_key(f"settle_hist_{scope}", history, "settlement_id"), height=min(360, 38 + 35 * len(show)),
                           column_config={"Date": st.column_config.DateColumn(format="DD MMM YYYY"), "Amount": money_col("Amount")})
         sel = ev.selection.rows if ev and ev.selection else []
-        if sel:
+        if sel and sel[0] < len(history):
             rec = history[sel[0]]
             d1, d2 = st.columns([3, 1], vertical_alignment="center")
             d1.markdown(f"<div class='muted'>Selected: {esc(rec['from_name'])} &rarr; {esc(rec['to_name'])}, {fmt(rec['amount'])} on {nice_date(rec['date'])}</div>",
@@ -1674,7 +1688,8 @@ def page_settings():
                     new_pw = st.text_input("New password", type="password", autocomplete="new-password")
                     new_pw2 = st.text_input("Confirm new password", type="password", autocomplete="new-password")
                     if st.form_submit_button("Change password", type="primary"):
-                        err = auth.change_password(ACCOUNT_ID, cur_pw, new_pw, new_pw2)
+                        err = auth.change_password(ACCOUNT_ID, cur_pw, new_pw, new_pw2,
+                                                   keep_token=st.session_state.get("auth_token"))
                         if err:
                             st.error(err)
                         else:
@@ -1872,7 +1887,7 @@ def page_admin():
                             st.error(err)
                         else:
                             db.set_password_hash(uid, auth.hash_password(p1))
-                            flash(f"New password set for {a['name']}", ":material/key:")
+                            flash(f"New password set for {a['name']}. They've been logged out everywhere.", ":material/key:")
                             st.rerun()
 
             with st.popover("Delete account", icon=":material/delete:", width="stretch"):

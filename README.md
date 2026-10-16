@@ -86,6 +86,7 @@ On first launch you create the admin account, optionally filled with six months 
 | `reminders.py` | Email rendering and delivery, reminder queue, daily scheduler, CLI |
 | `auth.py` | Password hashing, sign-up, login, sessions |
 | `database.py` | SQLite schema, migrations, CRUD, per-account visibility and sample data |
+| `tests/` | Checks for balances, accounts, circles and passwords (`pip install pytest`, then `python -m pytest tests`) |
 
 ## Database schema
 
