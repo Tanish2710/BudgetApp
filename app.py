@@ -387,10 +387,17 @@ def login_screen():
     signups_open = first_run or db.get_setting("signups_open", True)
     _, mid, _ = st.columns([1, 1.25, 1])
     with mid:
+        if st.session_state.get("verify_email"):
+            _verify_screen(st.session_state["verify_email"])
+            return
         if first_run:
             st.markdown("<div class='auth-brand'><h1>Set up Smart Budgeter</h1>"
                         "<p>Create the first account. It becomes the admin, who can manage everyone else's access.</p></div>",
                         unsafe_allow_html=True)
+            if not auth.email_ready():
+                st.warning("Email isn't set up yet, so the verification code can't be sent. Set the SMTP_HOST, "
+                           "SMTP_PORT, SMTP_USER, SMTP_PASS and FROM_EMAIL environment variables and restart the app.",
+                           icon=":material/mail_lock:")
             with st.container(border=True):
                 _signup_form("first_account", admin=True, offer_sample=not db.get_all_users())
             return
@@ -404,7 +411,13 @@ def login_screen():
                     pw = st.text_input("Password", type="password", autocomplete="current-password")
                     if st.form_submit_button("Log in", type="primary", width="stretch"):
                         account, err = auth.log_in(email, pw)
-                        if err:
+                        if err == auth.PENDING:
+                            # Signed up but never entered the code: send a fresh one (unless one just went out).
+                            clean = email.strip().lower()
+                            auth.resend_code(clean)
+                            st.session_state["verify_email"] = clean
+                            st.rerun()
+                        elif err:
                             st.error(err)
                         else:
                             _start_login(account)
@@ -427,15 +440,46 @@ def _signup_form(key, admin=False, offer_sample=False):
         pw2 = c2.text_input("Confirm password", type="password", autocomplete="new-password")
         sample = st.checkbox("Fill my account with six months of sample data", value=False) if offer_sample else False
         if st.form_submit_button("Create admin account" if admin else "Create account", type="primary", width="stretch"):
-            account, err = auth.sign_up(name, email, pw, pw2)
+            sent_to, err = auth.start_sign_up(name, email, pw, pw2)
             if err:
                 st.error(err)
             else:
-                if sample:
-                    db.seed_comprehensive_demo_data(as_user_id=account["user_id"])
-                flash(f"Welcome, {account['name'].split()[0]}! You're signed in"
-                      + (" as the admin." if account["role"] == "admin" else "."), ":material/waving_hand:")
-                _start_login(account)
+                st.session_state.update(verify_email=sent_to, verify_sample=bool(sample))
+                st.rerun()
+    st.markdown("<div class='auth-note'>We'll email you a code to confirm the address is yours.</div>",
+                unsafe_allow_html=True)
+
+
+def _verify_screen(email):
+    st.markdown("<div class='auth-brand'><h1>Check your email</h1>"
+                f"<p>We sent a 6-digit code to <b>{esc(email)}</b>. Enter it to finish creating your account.</p></div>",
+                unsafe_allow_html=True)
+    with st.container(border=True):
+        with st.form("verify_code"):
+            code = st.text_input("Verification code", max_chars=6, placeholder="123456", autocomplete="one-time-code")
+            if st.form_submit_button("Verify email", type="primary", width="stretch"):
+                account, err = auth.verify_code(email, code)
+                if err:
+                    st.error(err)
+                else:
+                    sample = st.session_state.pop("verify_sample", False)
+                    st.session_state.pop("verify_email", None)
+                    # Sample data replaces everything, so only offer it to the very first account.
+                    if sample and account["role"] == "admin" and len(db.get_all_users()) == 1:
+                        db.seed_comprehensive_demo_data(as_user_id=account["user_id"])
+                    flash(f"Email verified. Welcome, {account['name'].split()[0]}!"
+                          + (" You're the admin." if account["role"] == "admin" else ""), ":material/waving_hand:")
+                    _start_login(account)
+        c1, c2 = st.columns(2)
+        if c1.button("Send a new code", width="stretch", key="resend_code"):
+            err = auth.resend_code(email)
+            (st.error if err else st.success)(err or f"A new code is on its way to {email}.")
+        if c2.button("Back to log in", type="tertiary", width="stretch", key="verify_back"):
+            st.session_state.pop("verify_email", None)
+            st.session_state.pop("verify_sample", None)
+            st.rerun()
+    st.markdown(f"<div class='auth-note'>The code expires after {auth.CODE_MINUTES} minutes. "
+                "Can't find it? Check your spam folder.</div>", unsafe_allow_html=True)
 
 
 st.logo(os.path.join(BASE_DIR, "assets", "logo-dark.svg" if DARK else "logo.svg"), icon_image=os.path.join(BASE_DIR, "assets", "mark.svg"), size="large")
@@ -1503,7 +1547,8 @@ def page_reminders():
         creds = reminders.get_smtp_credentials(s)
         with left:
             with st.container(border=True):
-                section("SMTP server", "For Gmail use smtp.gmail.com, port 587 and an app password.")
+                section("SMTP server", "Used for reminders and for sign-up verification codes. "
+                                       "For Gmail use smtp.gmail.com, port 587 and an app password.")
                 with st.form("form_smtp"):
                     c1, c2 = st.columns([3, 1])
                     host = c1.text_input("Server", value=s["smtp_host"] or creds["host"])
@@ -1576,7 +1621,7 @@ def page_settings():
         left, right = st.columns(2, gap="medium")
         with left:
             with st.container(border=True):
-                section("Your profile", "Your email is also what you log in with.")
+                section("Your profile", "Your email is also what you log in with. A new email only takes effect once you confirm it.")
                 with st.form("form_profile"):
                     n = st.text_input("Name", value=ACCOUNT["name"])
                     e = st.text_input("Email", value=ACCOUNT.get("email") or "")
@@ -1587,11 +1632,32 @@ def page_settings():
                             st.error(err)
                         else:
                             try:
-                                db.update_user(ACCOUNT_ID, name=n, email=c_em, phone=c_ph or "")
-                                flash("Profile saved")
+                                db.update_user(ACCOUNT_ID, name=n, phone=c_ph or "")
+                                if c_em != (ACCOUNT.get("email") or "").lower():
+                                    sent_to, err = auth.start_email_change(ACCOUNT_ID, c_em)
+                                    if err:
+                                        raise ValueError(err)
+                                    st.session_state["email_change"] = sent_to
+                                    flash(f"We sent a code to {sent_to}. Enter it below to switch your email.", ":material/mail:")
+                                else:
+                                    flash("Profile saved")
                                 st.rerun()
                             except ValueError as ex:
                                 st.error(str(ex))
+                pending_email = st.session_state.get("email_change")
+                if pending_email:
+                    with st.form("form_email_code", border=False):
+                        c1, c2 = st.columns([2, 1], vertical_alignment="bottom")
+                        code = c1.text_input("Code from the email", max_chars=6, autocomplete="one-time-code",
+                                             help=f"We sent it to {pending_email}. Your current email keeps working until you confirm.")
+                        if c2.form_submit_button("Confirm", type="primary", width="stretch"):
+                            _, err = auth.verify_code(pending_email, code)
+                            if err:
+                                st.error(err)
+                            else:
+                                st.session_state.pop("email_change", None)
+                                flash(f"Your login email is now {pending_email}")
+                                st.rerun()
             if IS_ADMIN:
                 with st.container(border=True):
                     section("Currency", "Used throughout the app and in reminder emails, for every account.")

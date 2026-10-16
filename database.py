@@ -53,6 +53,20 @@ CREATE TABLE IF NOT EXISTS users (
     last_login     TEXT
 );
 
+-- Sign-ups and email changes waiting for the emailed code. Nothing becomes an account
+-- (or changes its login email) until the code is entered.
+CREATE TABLE IF NOT EXISTS pending_verifications (
+    email         TEXT PRIMARY KEY,
+    user_id       INTEGER,            -- set for an email change, NULL for a new sign-up
+    name          TEXT,
+    password_hash TEXT,
+    code_hash     TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    attempts      INTEGER DEFAULT 0,
+    sent_at       TEXT NOT NULL,
+    created_at    TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     user_id    INTEGER NOT NULL,
@@ -448,6 +462,51 @@ def create_account(name, email, password_hash):
         raise
     finally:
         conn.close()
+
+
+def _now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def save_pending_verification(email, code_hash, expires_at, name=None, password_hash=None, user_id=None):
+    """Create or replace the pending sign-up / email change for this address."""
+    conn = get_db_connection()
+    conn.execute("DELETE FROM pending_verifications WHERE created_at < datetime('now', '-2 days')")
+    conn.execute("""
+        INSERT INTO pending_verifications (email, user_id, name, password_hash, code_hash, expires_at, attempts, sent_at)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+        ON CONFLICT(email) DO UPDATE SET user_id = excluded.user_id, name = excluded.name,
+            password_hash = excluded.password_hash, code_hash = excluded.code_hash,
+            expires_at = excluded.expires_at, attempts = 0, sent_at = excluded.sent_at,
+            created_at = datetime('now')
+    """, (str(email).strip().lower(), user_id, name, password_hash, code_hash, expires_at, _now()))
+    conn.commit(); conn.close()
+
+
+def refresh_pending_code(email, code_hash, expires_at):
+    conn = get_db_connection()
+    conn.execute("UPDATE pending_verifications SET code_hash = ?, expires_at = ?, attempts = 0, sent_at = ? WHERE email = ?",
+                 (code_hash, expires_at, _now(), str(email).strip().lower()))
+    conn.commit(); conn.close()
+
+
+def get_pending_verification(email):
+    conn = get_db_connection()
+    row = conn.execute("SELECT * FROM pending_verifications WHERE email = ?", (str(email or "").strip().lower(),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def count_pending_attempt(email):
+    conn = get_db_connection()
+    conn.execute("UPDATE pending_verifications SET attempts = attempts + 1 WHERE email = ?", (str(email).strip().lower(),))
+    conn.commit(); conn.close()
+
+
+def delete_pending_verification(email):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM pending_verifications WHERE email = ?", (str(email).strip().lower(),))
+    conn.commit(); conn.close()
 
 
 def set_password_hash(user_id, password_hash):
