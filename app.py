@@ -15,6 +15,7 @@ import streamlit as st
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
+import auth  # noqa: E402
 import charts  # noqa: E402
 import database as db  # noqa: E402
 import logic  # noqa: E402
@@ -51,6 +52,7 @@ CURRENCIES = ["₹", "$", "€", "£", "¥"]
 # the chart colours), so it is mirrored into a cookie that arrives with the request.
 THEME_COOKIE = "sb_theme"
 PROFILE_COOKIE = "sb_profile"  # carries "Viewing as" across the reload a theme switch needs
+SESSION_COOKIE = "sb_session"  # keeps you logged in across reloads (incl. the theme switch)
 
 if "dark_mode" not in st.session_state:
     st.session_state["dark_mode"] = st.context.cookies.get(THEME_COOKIE) == "dark"
@@ -203,6 +205,16 @@ st.markdown("""
   .chip-warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-line); }
   .chip-blue { color: var(--blue); background: var(--blue-bg); border-color: var(--blue-line); }
 
+  .auth-brand { text-align: center; margin: 1.6rem 0 1.2rem 0; }
+  .auth-brand h1 { font-size: 1.6rem; font-weight: 700; margin: 0; padding: 0; color: var(--ink); }
+  .auth-brand p { margin: .35rem 0 0 0; color: var(--ink-2); font-size: .92rem; }
+  .auth-note { font-size: .8rem; color: var(--muted); text-align: center; margin-top: 10px; }
+  .acct { border: 1px solid var(--line); background: var(--surface); border-radius: 10px; padding: 10px 12px; margin: 2px 0 8px 0; }
+  .acct-name { font-size: .9rem; font-weight: 600; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .acct-mail { font-size: .76rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .viewing { font-size: .84rem; color: var(--blue); background: var(--blue-bg); border: 1px solid var(--blue-line);
+             border-radius: 8px; padding: 8px 12px; margin: 0 0 14px 0; }
+
   .empty { text-align: center; padding: 36px 16px; color: var(--ink-2); }
   .empty b { display: block; color: var(--ink); font-size: 1rem; margin-bottom: 4px; }
   .muted { color: var(--muted); font-size: .82rem; }
@@ -322,58 +334,173 @@ for _msg, _icon in st.session_state.pop("_flash", []):
     st.toast(_msg, icon=_icon)
 
 # ---------------------------------------------------------------------------
-# Data shared by every page
+# Login
 # ---------------------------------------------------------------------------
-users = db.get_all_users()
-user_map = {u["user_id"]: u for u in users}
-groups = db.get_all_groups()
-group_map = {g["group_id"]: g for g in groups}
-today = date.today()
-cur_month = today.strftime("%Y-%m")
+# Streamlit has no server-side cookies, so the session token is written into the browser
+# with a little script; it is read back from the request on the next page load.
+AUTH_KEYS = ("auth_uid", "auth_token", "dark_mode")
+
+
+def _cookie_script(token):
+    value = (f"{SESSION_COOKIE}={token}; path=/; max-age={auth.SESSION_DAYS * 86400}; SameSite=Lax" if token
+             else f"{SESSION_COOKIE}=; path=/; max-age=0; SameSite=Lax")
+    return f"<script>document.cookie = '{value}' + (location.protocol === 'https:' ? '; Secure' : '');</script>"
+
+
+def _start_login(account):
+    token = auth.start_session(account["user_id"])
+    st.session_state.update(auth_uid=account["user_id"], auth_token=token, _set_cookie=token)
+    st.rerun()
+
+
+def _log_out():
+    auth.end_session(st.session_state.get("auth_token"))
+    dark = st.session_state.get("dark_mode", False)
+    st.session_state.clear()
+    st.session_state.update(dark_mode=dark, _clear_cookie=True)
+
+
+def _reset_view_state():
+    """Forget page selections (e.g. after the data is replaced) but stay logged in."""
+    for k in list(st.session_state.keys()):
+        if k not in AUTH_KEYS:
+            del st.session_state[k]
+
+
+def current_account():
+    uid = st.session_state.get("auth_uid")
+    if uid:
+        acct = db.get_user(uid)
+        if acct and acct.get("password_hash") and acct.get("is_active"):
+            return acct
+        _log_out()  # deactivated or deleted while logged in
+        return None
+    token = st.context.cookies.get(SESSION_COOKIE)
+    acct = auth.account_for_token(token)
+    if acct:
+        st.session_state.update(auth_uid=acct["user_id"], auth_token=token)
+    return acct
+
+
+def login_screen():
+    first_run = db.count_accounts() == 0
+    signups_open = first_run or db.get_setting("signups_open", True)
+    _, mid, _ = st.columns([1, 1.25, 1])
+    with mid:
+        if first_run:
+            st.markdown("<div class='auth-brand'><h1>Set up Smart Budgeter</h1>"
+                        "<p>Create the first account. It becomes the admin, who can manage everyone else's access.</p></div>",
+                        unsafe_allow_html=True)
+            with st.container(border=True):
+                _signup_form("first_account", admin=True, offer_sample=not db.get_all_users())
+            return
+        st.markdown("<div class='auth-brand'><h1>Smart Budgeter</h1>"
+                    "<p>Budgets, shared bills and settle-ups in one place.</p></div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            t_in, t_up = st.tabs(["Log in", "Create account"])
+            with t_in:
+                with st.form("login"):
+                    email = st.text_input("Email", placeholder="you@example.com", autocomplete="email")
+                    pw = st.text_input("Password", type="password", autocomplete="current-password")
+                    if st.form_submit_button("Log in", type="primary", width="stretch"):
+                        account, err = auth.log_in(email, pw)
+                        if err:
+                            st.error(err)
+                        else:
+                            _start_login(account)
+            with t_up:
+                if signups_open:
+                    _signup_form("signup")
+                else:
+                    empty_state("Sign-ups are closed", "Ask an admin to create space for you.")
+        st.markdown("<div class='auth-note'>Forgot your password? Ask an admin to set a new one.</div>",
+                    unsafe_allow_html=True)
+
+
+def _signup_form(key, admin=False, offer_sample=False):
+    with st.form(key):
+        name = st.text_input("Name", placeholder="e.g. Priya Sharma", autocomplete="name")
+        email = st.text_input("Email", placeholder="you@example.com", autocomplete="email")
+        c1, c2 = st.columns(2)
+        pw = c1.text_input("Password", type="password", autocomplete="new-password",
+                           help=f"At least {auth.MIN_PASSWORD_LENGTH} characters, with a letter and a number.")
+        pw2 = c2.text_input("Confirm password", type="password", autocomplete="new-password")
+        sample = st.checkbox("Fill my account with six months of sample data", value=False) if offer_sample else False
+        if st.form_submit_button("Create admin account" if admin else "Create account", type="primary", width="stretch"):
+            account, err = auth.sign_up(name, email, pw, pw2)
+            if err:
+                st.error(err)
+            else:
+                if sample:
+                    db.seed_comprehensive_demo_data(as_user_id=account["user_id"])
+                flash(f"Welcome, {account['name'].split()[0]}! You're signed in"
+                      + (" as the admin." if account["role"] == "admin" else "."), ":material/waving_hand:")
+                _start_login(account)
+
 
 st.logo(os.path.join(BASE_DIR, "assets", "logo-dark.svg" if DARK else "logo.svg"), icon_image=os.path.join(BASE_DIR, "assets", "mark.svg"), size="large")
 
-# ---------------------------------------------------------------------------
-# First run
-# ---------------------------------------------------------------------------
-if not users:
-    _, mid, _ = st.columns([1, 2, 1])
-    with mid:
-        st.write("")
-        page_header("Welcome to Smart Budgeter",
-                    "Track your spending against a budget, split bills with friends, and send payment reminders automatically.")
-        with st.container(border=True):
-            section("Create your profile", "You can add other people later from Settings.")
-            with st.form("onboard_user"):
-                n = st.text_input("Name", placeholder="e.g. Priya Sharma")
-                e = st.text_input("Email", placeholder="priya@example.com")
-                b = st.number_input(f"Monthly budget ({CURR})", min_value=0.0, value=40000.0, step=1000.0)
-                if st.form_submit_button("Create profile", type="primary", width="stretch"):
-                    ok, err, c_em, c_ph = logic.validate_user_data(n, e, None)
-                    if not ok:
-                        st.error(err)
-                    else:
-                        db.create_user(n.strip(), c_em, c_ph, float(b))
-                        st.rerun()
-        st.markdown("<div class='muted' style='text-align:center;margin:12px 0 8px'>or</div>", unsafe_allow_html=True)
-        if st.button("Explore with sample data", width="stretch"):
-            db.seed_comprehensive_demo_data(reset=True)
-            st.rerun()
+ACCOUNT = current_account()
+with st.sidebar:
+    if "_set_cookie" in st.session_state:
+        st.html(_cookie_script(st.session_state.pop("_set_cookie")), unsafe_allow_javascript=True)
+    if st.session_state.pop("_clear_cookie", False):
+        st.html(_cookie_script(None), unsafe_allow_javascript=True)
+
+if ACCOUNT is None:
+    # A single hidden page replaces the app's navigation, so nothing from a previous
+    # session's sidebar lingers after logging out.
     theme_toggle()
+    st.navigation([st.Page(login_screen, title="Log in", icon=":material/login:", default=True)],
+                  position="hidden").run()
     st.stop()
 
+ACCOUNT_ID = ACCOUNT["user_id"]
+IS_ADMIN = ACCOUNT["role"] == "admin"
+
 # ---------------------------------------------------------------------------
-# Sidebar: active profile
+# Data shared by every page, limited to what this account may see
 # ---------------------------------------------------------------------------
-user_ids = [u["user_id"] for u in users]
+# Admins see everything. Everyone else sees their own profile, the contacts they added,
+# and the circles they made or belong to (with those circles' members).
+groups = db.get_visible_groups(ACCOUNT)
+group_map = {g["group_id"]: g for g in groups}
+GROUP_IDS = list(group_map)
+SCOPE = None if IS_ADMIN else GROUP_IDS  # circle filter for "all circles" queries
+profiles = db.get_managed_profiles(ACCOUNT)
+users = db.get_visible_people(ACCOUNT, GROUP_IDS)
+user_map = {u["user_id"]: u for u in users}
+user_map.update({u["user_id"]: u for u in profiles})
+today = date.today()
+cur_month = today.strftime("%Y-%m")
+
+# ---------------------------------------------------------------------------
+# Sidebar: account and active profile
+# ---------------------------------------------------------------------------
+profile_ids = [u["user_id"] for u in profiles]
+if st.session_state.get("_view_as") in profile_ids:
+    st.session_state["active_user_id"] = st.session_state.pop("_view_as")
 _profile_cookie = st.context.cookies.get(PROFILE_COOKIE, "")
-ensure_choice("active_user_id", user_ids, int(_profile_cookie) if _profile_cookie.isdigit() else None)
+_cookie_pid = int(_profile_cookie) if _profile_cookie.isdigit() else None
+ensure_choice("active_user_id", profile_ids, _cookie_pid if _cookie_pid in profile_ids else ACCOUNT_ID)
 with st.sidebar:
-    st.selectbox("Viewing as", user_ids, format_func=lambda i: user_map[i]["name"], key="active_user_id")
+    st.markdown(f"<div class='acct'><div class='acct-name'>{esc(ACCOUNT['name'])} &nbsp;"
+                f"{chip('Admin', 'blue') if IS_ADMIN else chip('User')}</div>"
+                f"<div class='acct-mail'>{esc(ACCOUNT['email'] or '')}</div></div>", unsafe_allow_html=True)
+    if len(profile_ids) > 1:
+        st.selectbox("Viewing as", profile_ids, key="active_user_id",
+                     format_func=lambda i: user_map[i]["name"] + (" (you)" if i == ACCOUNT_ID else ""))
+    if st.button("Log out", icon=":material/logout:", width="stretch", key="logout"):
+        _log_out()
+        st.rerun()
 
 ACTIVE_ID = st.session_state["active_user_id"]
 ACTIVE = user_map[ACTIVE_ID]
 FIRST_NAME = ACTIVE["name"].split()[0]
+
+if ACTIVE_ID != ACCOUNT_ID and ACTIVE.get("password_hash"):
+    st.markdown(f"<div class='viewing'>You're viewing <b>{esc(ACTIVE['name'])}</b>'s budget as an admin. "
+                f"Changes you make here are saved to their account.</div>", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +552,8 @@ def page_overview():
 
     bs = logic.get_budget_status(ACTIVE_ID, cur_month)
     cf = logic.get_cash_flow_summary(ACTIVE_ID, cur_month)
-    shared_net = logic.compute_balances(None).get(ACTIVE_ID, 0.0)
-    my_groups = db.get_user_groups(ACTIVE_ID)
+    shared_net = logic.compute_balances(None, SCOPE).get(ACTIVE_ID, 0.0)
+    my_groups = [g for g in db.get_user_groups(ACTIVE_ID) if g["group_id"] in group_map]
 
     k1, k2, k3, k4 = st.columns(4)
     with k1:
@@ -510,7 +637,7 @@ def page_overview():
     with right:
         with st.container(border=True):
             section("Shared balances", "Suggested payments involving you.")
-            plan = [t for t in logic.get_settlement_plan(None) if ACTIVE_ID in (t["from_user"], t["to_user"])]
+            plan = [t for t in logic.get_settlement_plan(None, SCOPE) if ACTIVE_ID in (t["from_user"], t["to_user"])]
             if not plan:
                 empty_state("You're all settled up", "")
             for i, t in enumerate(plan):
@@ -867,7 +994,9 @@ def _new_circle_form(key):
         include_me = st.checkbox(f"Add {FIRST_NAME} as a member", value=True)
         if st.form_submit_button("Create circle", type="primary", width="stretch"):
             try:
-                gid = db.create_group(name)
+                if db.circle_name_taken(ACCOUNT_ID, name):
+                    raise ValueError(f"You already have a circle named '{name.strip()}'.")
+                gid = db.create_group(name, owner_id=ACCOUNT_ID)
                 if include_me:
                     db.add_member_to_group(gid, ACTIVE_ID)
                 st.session_state["circle_id"] = gid
@@ -888,7 +1017,7 @@ def page_circles():
         return
 
     gids = [g["group_id"] for g in groups]
-    mine = [g["group_id"] for g in db.get_user_groups(ACTIVE_ID)]
+    mine = [g["group_id"] for g in db.get_user_groups(ACTIVE_ID) if g["group_id"] in group_map]
     ensure_choice("circle_id", gids, default=mine[0] if mine else None)
     c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
     gid = c1.selectbox("Circle", gids, format_func=lambda i: group_map[i]["group_name"], key="circle_id")
@@ -1094,8 +1223,21 @@ def _circle_settings(gid, members, balances):
                     flash(f"Added {user_map[to_add]['name']}")
                     st.rerun()
             else:
-                st.markdown("<div class='muted'>Everyone is already a member. Add new people in Settings.</div>",
+                st.markdown("<div class='muted'>Everyone you know is already a member. Add new people in Settings.</div>",
                             unsafe_allow_html=True)
+            with st.form(f"add_by_email_{gid}", clear_on_submit=True, border=False):
+                e1, e2 = st.columns([2, 1], vertical_alignment="bottom")
+                em = e1.text_input("Add someone with an account", placeholder="their account email")
+                if e2.form_submit_button("Add", width="stretch"):
+                    acct = db.get_account_by_email(em)
+                    if not acct or not acct["is_active"]:
+                        st.error("No account uses that email. Add them as a person in Settings instead.")
+                    elif acct["user_id"] in member_ids:
+                        st.info(f"{acct['name']} is already a member.")
+                    else:
+                        db.add_member_to_group(gid, acct["user_id"])
+                        flash(f"Added {acct['name']}")
+                        st.rerun()
             if members:
                 r1, r2 = st.columns([2, 1], vertical_alignment="bottom")
                 to_rm = r1.selectbox("Remove", member_ids, format_func=lambda i: user_map[i]["name"], key=f"rm_m_{gid}")
@@ -1117,6 +1259,10 @@ def _circle_settings(gid, members, balances):
                         st.rerun()
                     except ValueError as e:
                         st.error(str(e))
+            if not (IS_ADMIN or group_map[gid].get("owner_id") == ACCOUNT_ID):
+                st.markdown("<div class='muted'>Only the person who created this circle, or an admin, can delete it.</div>",
+                            unsafe_allow_html=True)
+                return
             with st.popover("Delete circle", icon=":material/delete:", width="stretch"):
                 st.write("This permanently deletes the circle, its bills and its splits.")
                 ok = st.checkbox("I understand", key=f"del_c_ok_{gid}")
@@ -1140,8 +1286,8 @@ def page_settle():
                           key="settle_scope")
     gid = scope or None
 
-    plan = logic.get_settlement_plan(gid)
-    bal_details = logic.compute_balances_detailed(gid)
+    plan = logic.get_settlement_plan(gid, SCOPE)
+    bal_details = logic.compute_balances_detailed(gid, SCOPE)
     i_owe = sum(t["amount"] for t in plan if t["from_user"] == ACTIVE_ID)
     owed_me = sum(t["amount"] for t in plan if t["to_user"] == ACTIVE_ID)
 
@@ -1187,7 +1333,7 @@ def page_settle():
             section("Payment flow", "Width shows how much each person pays.")
             plot("debt_flow", plan, CURR)
 
-    history = db.get_settlements(gid)
+    history = db.get_settlements(gid, SCOPE)
     with st.container(border=True):
         section("Payment history", "Select a row to delete a payment recorded by mistake.")
         if not history:
@@ -1370,7 +1516,7 @@ def page_reminders():
                     from_email = c5.text_input("From address", value=s["from_email"] or creds["from_email"],
                                                placeholder="Defaults to the username")
                     sender = c6.text_input("Sender name", value=s["sender_name"] or reminders.APP_NAME)
-                    test_to = st.text_input("Send a test email to", value=ACTIVE.get("email") or "")
+                    test_to = st.text_input("Send a test email to", value=ACCOUNT.get("email") or "")
                     b1, b2, _ = st.columns([1, 1, 2])
                     save = b1.form_submit_button("Save", type="primary", width="stretch")
                     test = b2.form_submit_button("Save and test", width="stretch")
@@ -1423,47 +1569,79 @@ def page_reminders():
 # Page: Settings
 # ---------------------------------------------------------------------------
 def page_settings():
-    page_header("Settings", "Preferences, people and data.")
-    t_pref, t_people, t_data = st.tabs(["Preferences", "People", "Data"])
+    page_header("Settings", "Your account, the people you split with, and your data.")
+    t_acct, t_people, t_data = st.tabs(["Account", "People", "Data"])
 
-    with t_pref:
+    with t_acct:
         left, right = st.columns(2, gap="medium")
         with left:
             with st.container(border=True):
-                section("Currency", "Used throughout the app and in reminder emails.")
-                cur = st.selectbox("Currency symbol", CURRENCIES, index=CURRENCIES.index(CURR) if CURR in CURRENCIES else 0)
-                if cur != CURR:
-                    reminders.save_settings({"currency": cur})
-                    flash(f"Currency set to {cur}")
-                    st.rerun()
-        with right:
-            with st.container(border=True):
-                section("Your profile", ACTIVE["name"])
+                section("Your profile", "Your email is also what you log in with.")
                 with st.form("form_profile"):
-                    n = st.text_input("Name", value=ACTIVE["name"])
-                    e = st.text_input("Email", value=ACTIVE.get("email") or "")
-                    p = st.text_input("Mobile (optional)", value=ACTIVE.get("phone") or "")
+                    n = st.text_input("Name", value=ACCOUNT["name"])
+                    e = st.text_input("Email", value=ACCOUNT.get("email") or "")
+                    p = st.text_input("Mobile (optional)", value=ACCOUNT.get("phone") or "")
                     if st.form_submit_button("Save profile", type="primary"):
-                        ok, err, c_em, c_ph = logic.validate_user_data(n, e, p, exclude_user_id=ACTIVE_ID)
+                        ok, err, c_em, c_ph = logic.validate_user_data(n, e, p, exclude_user_id=ACCOUNT_ID)
                         if not ok:
                             st.error(err)
                         else:
                             try:
-                                db.update_user(ACTIVE_ID, name=n, email=c_em, phone=c_ph or "")
+                                db.update_user(ACCOUNT_ID, name=n, email=c_em, phone=c_ph or "")
                                 flash("Profile saved")
                                 st.rerun()
                             except ValueError as ex:
                                 st.error(str(ex))
+            if IS_ADMIN:
+                with st.container(border=True):
+                    section("Currency", "Used throughout the app and in reminder emails, for every account.")
+                    cur = st.selectbox("Currency symbol", CURRENCIES, index=CURRENCIES.index(CURR) if CURR in CURRENCIES else 0)
+                    if cur != CURR:
+                        reminders.save_settings({"currency": cur})
+                        flash(f"Currency set to {cur}")
+                        st.rerun()
+        with right:
+            with st.container(border=True):
+                section("Change password", f"At least {auth.MIN_PASSWORD_LENGTH} characters, with a letter and a number.")
+                with st.form("form_password", clear_on_submit=True):
+                    cur_pw = st.text_input("Current password", type="password", autocomplete="current-password")
+                    new_pw = st.text_input("New password", type="password", autocomplete="new-password")
+                    new_pw2 = st.text_input("Confirm new password", type="password", autocomplete="new-password")
+                    if st.form_submit_button("Change password", type="primary"):
+                        err = auth.change_password(ACCOUNT_ID, cur_pw, new_pw, new_pw2)
+                        if err:
+                            st.error(err)
+                        else:
+                            flash("Password changed", ":material/key:")
+                            st.rerun()
 
     with t_people:
+        # People without an account ("contacts") exist to split bills with. Regular users
+        # manage the ones they added; admins see and manage everyone.
+        contacts = [u for u in (users if IS_ADMIN else profiles)
+                    if not u.get("password_hash") and (IS_ADMIN or u.get("owner_id") == ACCOUNT_ID)]
         left, right = st.columns([3, 2], gap="medium")
         with left:
             with st.container(border=True):
-                section("People", f"{len(users)} profile(s). Everyone can be added to circles and receive reminders.")
-                df = pd.DataFrame(users)
-                st.dataframe(df[["name", "email", "phone", "monthly_budget"]], hide_index=True, width="stretch",
-                             column_config={"name": "Name", "email": "Email", "phone": "Mobile",
-                                            "monthly_budget": money_col("Monthly budget")})
+                if IS_ADMIN:
+                    section("Everyone", f"{len(users)} people. Accounts can log in; contacts are people added to split bills with.")
+                    df = pd.DataFrame(users)
+                    df["kind"] = df["password_hash"].map(lambda h: "Account" if h else "Contact")
+                    st.dataframe(df[["name", "email", "phone", "kind", "monthly_budget"]], hide_index=True, width="stretch",
+                                 column_config={"name": "Name", "email": "Email", "phone": "Mobile", "kind": "Type",
+                                                "monthly_budget": money_col("Monthly budget")})
+                else:
+                    section("Your people", "People you've added to split bills with. They don't need an account.")
+                    if contacts:
+                        df = pd.DataFrame(contacts)
+                        st.dataframe(df[["name", "email", "phone", "monthly_budget"]], hide_index=True, width="stretch",
+                                     column_config={"name": "Name", "email": "Email", "phone": "Mobile",
+                                                    "monthly_budget": money_col("Monthly budget")})
+                    else:
+                        empty_state("No one yet", "Add the people you share bills with.")
+                    st.markdown("<div class='muted'>Someone who already has an account? Add them to a circle by email "
+                                "from the circle's Members & settings tab. If a person you add here signs up later "
+                                "with the same email, they take over their profile.</div>", unsafe_allow_html=True)
         with right:
             with st.container(border=True):
                 section("Add a person")
@@ -1478,49 +1656,168 @@ def page_settings():
                             st.error(err)
                         else:
                             try:
-                                db.create_user(n.strip(), c_em, c_ph, float(b))
+                                db.create_user(n.strip(), c_em, c_ph, float(b), owner_id=ACCOUNT_ID)
                                 flash(f"Added {n.strip()}")
                                 st.rerun()
                             except ValueError as ex:
                                 st.error(str(ex))
-            with st.container(border=True):
-                section("Remove a person", "Deletes their transactions, splits and payments.")
-                others = [u["user_id"] for u in users]
-                victim = st.selectbox("Person", others, format_func=lambda i: user_map[i]["name"], key="rm_person")
-                ok = st.checkbox("I understand this can't be undone", key="rm_person_ok")
-                if st.button("Remove person", disabled=not ok or len(users) <= 1, width="stretch"):
-                    db.delete_user(victim)
-                    flash(f"Removed {user_map[victim]['name']}", ":material/person_remove:")
-                    st.rerun()
+            if contacts:
+                with st.container(border=True):
+                    section("Remove a person", "Deletes their transactions, splits and payments."
+                            + (" Accounts are removed from the Admin page." if IS_ADMIN else ""))
+                    cmap = {u["user_id"]: u for u in contacts}
+                    victim = st.selectbox("Person", list(cmap), format_func=lambda i: cmap[i]["name"], key="rm_person")
+                    ok = st.checkbox("I understand this can't be undone", key="rm_person_ok")
+                    if st.button("Remove person", disabled=not ok, width="stretch"):
+                        db.delete_user(victim)
+                        flash(f"Removed {cmap[victim]['name']}", ":material/person_remove:")
+                        st.rerun()
 
     with t_data:
+        mine = set(profile_ids)
         c1, c2, c3 = st.columns(3, gap="medium")
         exports = [
-            (c1, "Expenses", db.get_all_expenses(), "expenses"),
-            (c2, "Income", db.get_user_incomes(), "income"),
-            (c3, "Payments", db.get_settlements(), "payments"),
+            (c1, "Expenses", [r for r in db.get_all_expenses() if IS_ADMIN or r["user_id"] in mine], "expenses"),
+            (c2, "Income", [r for r in db.get_user_incomes() if IS_ADMIN or r["user_id"] in mine], "income"),
+            (c3, "Payments", db.get_settlements(None, SCOPE), "payments"),
         ]
         for col, title, rows, slug in exports:
             with col:
                 with st.container(border=True):
-                    section(title, f"{len(rows)} record(s), all people")
+                    section(title, f"{len(rows)} record(s), " + ("everyone" if IS_ADMIN else "you and your people"))
                     st.download_button("Download CSV", data=pd.DataFrame(rows).to_csv(index=False).encode("utf-8"),
                                        file_name=f"{slug}_{today.isoformat()}.csv", mime="text/csv",
                                        disabled=not rows, width="stretch", key=f"dl_{slug}", icon=":material/download:",
                                        on_click="ignore")
+        if IS_ADMIN:
+            with st.container(border=True):
+                section("Reset", "Both actions erase the budget data of every account. Accounts, passwords, roles "
+                                 "and reminder settings are kept.")
+                ok = st.checkbox("I understand all current data will be erased", key="reset_ok")
+                b1, b2, _ = st.columns([1, 1, 2])
+                if b1.button("Load sample data", disabled=not ok, width="stretch",
+                             help="Six months of sample data with you as the main person"):
+                    db.seed_comprehensive_demo_data(as_user_id=ACCOUNT_ID)
+                    _reset_view_state()
+                    flash("Sample data loaded")
+                    st.rerun()
+                if b2.button("Erase everything", disabled=not ok, width="stretch"):
+                    db.reset_data()
+                    _reset_view_state()
+                    flash("All budget data erased", ":material/delete:")
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Page: Admin
+# ---------------------------------------------------------------------------
+def _ts(v):
+    return pd.to_datetime(v, errors="coerce") if v else pd.NaT
+
+
+def page_admin():
+    page_header("Admin", "Every account, its role and its access.")
+    accounts = db.get_accounts()
+    amap = {a["user_id"]: a for a in accounts}
+    active = [a for a in accounts if a["is_active"]]
+    admins = [a for a in active if a["role"] == "admin"]
+    signups_open = bool(db.get_setting("signups_open", True))
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        tile("Accounts", str(len(accounts)), f"{len(active)} active")
+    with k2:
+        tile("Admins", str(len(admins)), "Full access to every account")
+    with k3:
+        tile("Users", str(len(active) - len(admins)), "See only their own data")
+    with k4:
+        tile("New sign-ups", "Open" if signups_open else "Closed",
+             "Anyone can create an account" if signups_open else "Only existing accounts can log in",
+             tone="" if signups_open else "warn")
+
+    st.write("")
+    left, right = st.columns([3, 2], gap="medium")
+    with left:
         with st.container(border=True):
-            section("Reset", "Both actions replace everything in the database. Reminder and email settings are kept.")
-            ok = st.checkbox("I understand all current data will be erased", key="reset_ok")
-            b1, b2, _ = st.columns([1, 1, 2])
-            if b1.button("Load sample data", disabled=not ok, width="stretch"):
-                db.seed_comprehensive_demo_data(reset=True)
-                st.session_state.clear()
-                flash("Sample data loaded")
+            section("Accounts", "Manage one from the panel on the right.")
+            df = pd.DataFrame([{
+                "Name": a["name"], "Email": a["email"],
+                "Role": "Admin" if a["role"] == "admin" else "User",
+                "Status": "Active" if a["is_active"] else "Deactivated",
+                "Joined": _ts(a["created_at"]), "Last login": _ts(a["last_login"]),
+                "Expenses": a["expense_count"], "People": a["contact_count"],
+            } for a in accounts])
+            st.dataframe(df, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(df)),
+                         column_config={"Joined": st.column_config.DateColumn(format="DD MMM YYYY"),
+                                        "Last login": st.column_config.DatetimeColumn(format="DD MMM, HH:mm")})
+        with st.container(border=True):
+            section("Sign-ups")
+            new_open = st.toggle("Let new people create accounts", value=signups_open, key="signups_toggle")
+            if new_open != signups_open:
+                db.set_setting("signups_open", bool(new_open))
+                flash("Sign-ups opened" if new_open else "Sign-ups closed")
                 st.rerun()
-            if b2.button("Erase everything", disabled=not ok, width="stretch"):
-                db.reset_database()
-                st.session_state.clear()
+
+    with right:
+        with st.container(border=True):
+            section("Manage an account")
+            ensure_choice("admin_pick", list(amap), ACCOUNT_ID)
+            uid = st.selectbox("Account", list(amap), key="admin_pick",
+                               format_func=lambda i: f"{amap[i]['name']} · {amap[i]['email']}")
+            a = amap[uid]
+            st.markdown(
+                f"<div style='margin:2px 0 10px'>{chip('Admin', 'blue') if a['role'] == 'admin' else chip('User')} "
+                f"{chip('Active', 'pos') if a['is_active'] else chip('Deactivated', 'neg')}</div>",
+                unsafe_allow_html=True)
+            if uid == ACCOUNT_ID:
+                st.markdown("<div class='muted'>This is you. Another admin can change your role or access, "
+                            "so the app always keeps at least one admin.</div>", unsafe_allow_html=True)
+                return
+            if st.button("Open their budget", icon=":material/visibility:", width="stretch", key="admin_view"):
+                st.session_state["_view_as"] = uid
+                st.switch_page(PAGE_OVERVIEW)
+
+            r1, r2 = st.columns([2, 1], vertical_alignment="bottom")
+            role = r1.selectbox("Role", ["user", "admin"], index=1 if a["role"] == "admin" else 0,
+                                format_func=lambda r: "Admin" if r == "admin" else "User", key=f"role_{uid}")
+            if r2.button("Save role", width="stretch", disabled=role == a["role"], key=f"save_role_{uid}"):
+                db.set_account_role(uid, role)
+                flash(f"{a['name']} is now {'an admin' if role == 'admin' else 'a regular user'}")
                 st.rerun()
+
+            if a["is_active"]:
+                if st.button("Deactivate account", width="stretch", key=f"deact_{uid}",
+                             help="They're logged out and can't log in again until reactivated. Their data is kept."):
+                    db.set_account_active(uid, False)
+                    flash(f"Deactivated {a['name']}", ":material/block:")
+                    st.rerun()
+            elif st.button("Reactivate account", width="stretch", key=f"react_{uid}"):
+                db.set_account_active(uid, True)
+                flash(f"Reactivated {a['name']}")
+                st.rerun()
+
+            with st.popover("Set a new password", icon=":material/key:", width="stretch"):
+                with st.form(f"admin_pw_{uid}", clear_on_submit=True, border=False):
+                    p1 = st.text_input("New password", type="password", autocomplete="new-password")
+                    p2 = st.text_input("Confirm", type="password", autocomplete="new-password")
+                    if st.form_submit_button("Set password", type="primary", width="stretch"):
+                        err = auth.password_problem(p1, p2)
+                        if err:
+                            st.error(err)
+                        else:
+                            db.set_password_hash(uid, auth.hash_password(p1))
+                            flash(f"New password set for {a['name']}", ":material/key:")
+                            st.rerun()
+
+            with st.popover("Delete account", icon=":material/delete:", width="stretch"):
+                st.write(f"Delete **{a['name']}** and their transactions, budgets and payments? "
+                         "People and circles they created move to you.")
+                ok = st.checkbox("I understand this can't be undone", key=f"del_acct_ok_{uid}")
+                if st.button("Delete account", type="primary", disabled=not ok, key=f"del_acct_{uid}"):
+                    db.delete_account(uid, ACCOUNT_ID)
+                    st.session_state.pop("admin_pick", None)
+                    flash(f"Deleted {a['name']}", ":material/delete:")
+                    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1537,20 +1834,24 @@ PAGE_CIRCLES = st.Page(fragment(page_circles), title="Circles", icon=":material/
 PAGE_SETTLE = st.Page(fragment(page_settle), title="Settle up", icon=":material/handshake:", url_path="settle-up")
 PAGE_REMINDERS = st.Page(fragment(page_reminders), title="Reminders", icon=":material/notifications:", url_path="reminders")
 PAGE_SETTINGS = st.Page(fragment(page_settings), title="Settings", icon=":material/settings:", url_path="settings")
+PAGE_ADMIN = st.Page(fragment(page_admin), title="Admin", icon=":material/admin_panel_settings:", url_path="admin")
 
-nav = st.navigation({
+# Reminders use the app-wide email server and schedule, so they sit with the admin tools.
+nav_sections = {
     "Personal": [PAGE_OVERVIEW, PAGE_TRANSACTIONS, PAGE_BUDGETS, PAGE_REPORTS],
-    "Shared": [PAGE_CIRCLES, PAGE_SETTLE, PAGE_REMINDERS],
-    "Account": [PAGE_SETTINGS],
-})
+    "Shared": [PAGE_CIRCLES, PAGE_SETTLE] + ([PAGE_REMINDERS] if IS_ADMIN else []),
+    "Account": [PAGE_SETTINGS] + ([PAGE_ADMIN] if IS_ADMIN else []),
+}
+nav = st.navigation(nav_sections)
 
-with st.sidebar:
-    st.markdown(
-        f"<div class='muted' style='margin-top:4px'>Automatic reminders: "
-        f"<b style='color:var(--ink)'>{'On' if SETTINGS['auto_enabled'] else 'Off'}</b>"
-        f"{' &middot; dry run' if SETTINGS['auto_enabled'] and not SETTINGS['live_mode'] else ''}</div>",
-        unsafe_allow_html=True,
-    )
+if IS_ADMIN:
+    with st.sidebar:
+        st.markdown(
+            f"<div class='muted' style='margin-top:4px'>Automatic reminders: "
+            f"<b style='color:var(--ink)'>{'On' if SETTINGS['auto_enabled'] else 'Off'}</b>"
+            f"{' &middot; dry run' if SETTINGS['auto_enabled'] and not SETTINGS['live_mode'] else ''}</div>",
+            unsafe_allow_html=True,
+        )
 theme_toggle(ACTIVE_ID)
 
 nav.run()
