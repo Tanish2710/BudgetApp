@@ -17,6 +17,16 @@ Personal budgeting and shared expenses in one Streamlit app: track spending agai
 
 **Light and dark mode**: a *Dark mode* switch at the bottom of the sidebar. The app starts in light mode and each browser remembers its choice; the light/dark buttons in Streamlit's ⋮ menu stay in step with the switch. Both palettes live in `.streamlit/config.toml` (`[theme.light]`, `[theme.dark]`), with matching CSS tokens in `app.py` and chart colours in `charts.py`.
 
+## Accounts and roles
+
+Everyone logs in with an email and password. Accounts are created from the **Create account** tab on the login screen.
+
+- **The first account becomes the admin.** Anything already in the database (people, circles, transactions) is assigned to that admin, so nothing is lost when upgrading. Every later account is a regular user.
+- **Users** see and edit only their own budget, the people they've added to split bills with, and the circles they created or belong to. To split with someone who has their own account, add them to a circle by their account email. If you add a person and they later sign up with the same email, they take over that profile, including the bills already recorded for them.
+- **Admins** can do everything a user can, plus: the **Admin** page (every account, promote/demote, deactivate/reactivate, set a new password, delete an account, open new sign-ups or close them), the **Reminders** page (the app-wide email server and schedule), the app currency, and resetting or loading sample data. The *Viewing as* box in the sidebar lets an admin open anyone's budget.
+
+Passwords are stored as salted PBKDF2-SHA256 hashes. Logging in creates a 30-day session; the browser keeps a random token in a cookie and the database keeps only its hash, so logging out or deactivating an account ends it. After five wrong passwords for an email, logins for it pause for five minutes. There's no email-based password reset: an admin sets a new password from the Admin page.
+
 ## Automatic reminders
 
 Configure everything on the **Reminders** page:
@@ -62,7 +72,7 @@ pip install -r requirements.txt
 ./run.sh            # or: python3 -m streamlit run app.py
 ```
 
-On first launch you can create your profile or load six months of sample data. The SQLite database lives at `data/finance.db` (override with `BUDGET_DB_PATH`).
+On first launch you create the admin account, optionally filled with six months of sample data. The SQLite database lives at `data/finance.db` (override with `BUDGET_DB_PATH`).
 
 ## Project layout
 
@@ -72,16 +82,19 @@ On first launch you can create your profile or load six months of sample data. T
 | `charts.py` | Plotly chart builders sharing one visual style and colour palette |
 | `logic.py` | Balances, debt simplification, budget pacing, reminder statements |
 | `reminders.py` | Email rendering and delivery, reminder queue, daily scheduler, CLI |
-| `database.py` | SQLite schema, migrations, CRUD and sample data |
+| `auth.py` | Password hashing, sign-up, login, sessions |
+| `database.py` | SQLite schema, migrations, CRUD, per-account visibility and sample data |
 
 ## Database schema
 
 ```sql
-users(user_id, name, email, phone, monthly_budget, created_at)
+users(user_id, name, email, phone, monthly_budget, created_at,
+      password_hash, role, is_active, owner_id, last_login)   -- accounts have a password; contacts belong to owner_id
+sessions(token_hash, user_id, expires_at, created_at)
 expenses(exp_id, user_id, amount, category, description, date, payment_method, notes)
 incomes(income_id, user_id, amount, source, description, date)
 category_budgets(budget_id, user_id, category, monthly_limit)
-groups(group_id, group_name, created_at)
+groups(group_id, group_name, created_at, owner_id)            -- circle names are unique per owner
 group_members(group_id, user_id, joined_at)
 shared_expenses(shared_id, group_id, payer_id, amount, description, category, date)
 splits(split_id, shared_id, user_id, amount_owed, is_paid)

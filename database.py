@@ -23,7 +23,7 @@ PAYMENT_METHODS = ["UPI", "Debit Card", "Credit Card", "Bank Transfer", "Cash", 
 SETTLEMENT_METHODS = ["UPI", "Bank Transfer", "Cash", "Card", "Other"]
 
 ALL_TABLES = [
-    "reminder_log", "splits", "shared_expenses", "settlements", "group_members", "groups",
+    "sessions", "reminder_log", "splits", "shared_expenses", "settlements", "group_members", "groups",
     "category_budgets", "incomes", "expenses", "users",
 ]
 
@@ -43,7 +43,22 @@ CREATE TABLE IF NOT EXISTS users (
     email          TEXT UNIQUE,
     phone          TEXT UNIQUE,
     monthly_budget REAL DEFAULT 0,
-    created_at     TEXT DEFAULT (datetime('now'))
+    created_at     TEXT DEFAULT (datetime('now')),
+    -- Accounts have a password_hash and a role ('admin' or 'user'). People without a
+    -- password are contacts: they exist to split bills with and belong to owner_id.
+    password_hash  TEXT,
+    role           TEXT,
+    is_active      INTEGER DEFAULT 1,
+    owner_id       INTEGER,
+    last_login     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS expenses (
@@ -79,8 +94,9 @@ CREATE TABLE IF NOT EXISTS category_budgets (
 
 CREATE TABLE IF NOT EXISTS groups (
     group_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_name TEXT NOT NULL UNIQUE,
-    created_at TEXT DEFAULT (datetime('now'))
+    group_name TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    owner_id   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS group_members (
@@ -160,6 +176,7 @@ CREATE INDEX IF NOT EXISTS idx_splits_paid ON splits(is_paid);
 CREATE INDEX IF NOT EXISTS idx_settlements_group ON settlements(group_id);
 CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 """
 
 def run_migrations(conn):
@@ -173,6 +190,13 @@ def run_migrations(conn):
         "ALTER TABLE settlements ADD COLUMN payment_method TEXT DEFAULT 'Cash'",
         # Data fix: a payer's own share of a bill is settled by definition.
         "UPDATE splits SET is_paid = 1 WHERE is_paid = 0 AND user_id = (SELECT payer_id FROM shared_expenses se WHERE se.shared_id = splits.shared_id)",
+        # Accounts and roles
+        "ALTER TABLE users ADD COLUMN password_hash TEXT",
+        "ALTER TABLE users ADD COLUMN role TEXT",
+        "ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1",
+        "ALTER TABLE users ADD COLUMN owner_id INTEGER",
+        "ALTER TABLE users ADD COLUMN last_login TEXT",
+        "ALTER TABLE groups ADD COLUMN owner_id INTEGER",
     ]
     for sql in migrations:
         try:
@@ -180,6 +204,42 @@ def run_migrations(conn):
         except sqlite3.OperationalError:
             pass
     conn.commit()
+    _drop_global_circle_name_unique(conn)
+    for sql in [
+        "CREATE INDEX IF NOT EXISTS idx_users_owner ON users(owner_id)",
+        "CREATE INDEX IF NOT EXISTS idx_groups_owner ON groups(owner_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_owner_name ON groups(owner_id, group_name)",
+    ]:
+        conn.execute(sql)
+    conn.commit()
+
+
+def _drop_global_circle_name_unique(conn):
+    """Circle names used to be unique across the whole app. With separate accounts two people
+    may both have an "Apartment" circle, so names are now unique per owner. SQLite can't drop a
+    column constraint, so the table is rebuilt (foreign keys off, so nothing cascades)."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'groups'").fetchone()
+    if not row or "UNIQUE" not in row["sql"].upper():
+        return
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute("""CREATE TABLE groups_new (
+            group_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_name TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            owner_id   INTEGER)""")
+        conn.execute("INSERT INTO groups_new (group_id, group_name, created_at, owner_id) "
+                     "SELECT group_id, group_name, created_at, owner_id FROM groups")
+        conn.execute("DROP TABLE groups")
+        conn.execute("ALTER TABLE groups_new RENAME TO groups")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 def init_db():
     conn = get_db_connection()
@@ -189,7 +249,7 @@ def init_db():
     return True
 
 # --- Users CRUD ---
-def create_user(name, email=None, phone=None, monthly_budget=0.0):
+def create_user(name, email=None, phone=None, monthly_budget=0.0, owner_id=None):
     # Support backward compatibility if monthly_budget is passed as 3rd positional argument
     if isinstance(phone, (int, float)) and monthly_budget == 0.0:
         monthly_budget = float(phone)
@@ -207,19 +267,19 @@ def create_user(name, email=None, phone=None, monthly_budget=0.0):
         existing_e = cur.execute("SELECT user_id, name FROM users WHERE LOWER(TRIM(email)) = LOWER(?)", (clean_email,)).fetchone()
         if existing_e:
             conn.close()
-            raise ValueError(f"Email '{clean_email}' is already registered to user '{existing_e['name']}'.")
+            raise ValueError(f"Email '{clean_email}' is already in use.")
 
     # Pre-check phone uniqueness
     if clean_phone:
         existing_p = cur.execute("SELECT user_id, name FROM users WHERE phone = ?", (clean_phone,)).fetchone()
         if existing_p:
             conn.close()
-            raise ValueError(f"Mobile number '{clean_phone}' is already registered to user '{existing_p['name']}'.")
+            raise ValueError(f"Mobile number '{clean_phone}' is already in use.")
 
     try:
         cur.execute(
-            "INSERT INTO users (name, email, phone, monthly_budget) VALUES (?, ?, ?, ?)",
-            (name, clean_email, clean_phone, float(monthly_budget))
+            "INSERT INTO users (name, email, phone, monthly_budget, owner_id) VALUES (?, ?, ?, ?, ?)",
+            (name, clean_email, clean_phone, float(monthly_budget), owner_id)
         )
         conn.commit()
         uid = cur.lastrowid
@@ -277,13 +337,13 @@ def update_user(user_id, name=None, email=None, phone=None, monthly_budget=None)
         existing_e = cur.execute("SELECT user_id, name FROM users WHERE LOWER(TRIM(email)) = LOWER(?) AND user_id != ?", (clean_email, user_id)).fetchone()
         if existing_e:
             conn.close()
-            raise ValueError(f"Email '{clean_email}' is already registered to user '{existing_e['name']}'.")
+            raise ValueError(f"Email '{clean_email}' is already in use.")
 
     if phone is not None and clean_phone:
         existing_p = cur.execute("SELECT user_id, name FROM users WHERE phone = ? AND user_id != ?", (clean_phone, user_id)).fetchone()
         if existing_p:
             conn.close()
-            raise ValueError(f"Mobile number '{clean_phone}' is already registered to user '{existing_p['name']}'.")
+            raise ValueError(f"Mobile number '{clean_phone}' is already in use.")
 
     fields, vals = [], []
     if name is not None:
@@ -319,6 +379,191 @@ def delete_user(user_id):
     conn = get_db_connection()
     conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
     conn.commit(); conn.close()
+
+# --- Accounts, roles and what each account can see ---
+# An account is a users row with a password. role is "admin" or "user". Contacts (rows with no
+# password) belong to the account in owner_id; circles belong to the account that made them.
+
+def count_accounts():
+    conn = get_db_connection()
+    n = conn.execute("SELECT COUNT(*) FROM users WHERE password_hash IS NOT NULL").fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_accounts():
+    conn = get_db_connection()
+    rows = conn.execute("""
+        SELECT u.*,
+               (SELECT COUNT(*) FROM expenses e WHERE e.user_id = u.user_id) AS expense_count,
+               (SELECT COUNT(*) FROM users c WHERE c.owner_id = u.user_id AND c.password_hash IS NULL) AS contact_count
+        FROM users u WHERE u.password_hash IS NOT NULL ORDER BY u.created_at, u.user_id
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_account_by_email(email):
+    """The account (not a contact) registered with this email, or None."""
+    conn = get_db_connection()
+    row = conn.execute("SELECT * FROM users WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) AND password_hash IS NOT NULL",
+                       (str(email or "").strip(),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def create_account(name, email, password_hash):
+    """
+    Create a login. The first account ever becomes the admin and takes ownership of every
+    person and circle already in the database; later accounts are regular users.
+    A contact someone added earlier with the same email is turned into the account, so the
+    person keeps the bills and balances already recorded for them.
+    Returns (user_id, role).
+    """
+    clean_email = str(email).strip().lower()
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")  # two simultaneous first sign-ups can't both become admin
+        if conn.execute("SELECT 1 FROM users WHERE LOWER(TRIM(email)) = ? AND password_hash IS NOT NULL",
+                        (clean_email,)).fetchone():
+            raise ValueError("An account with this email already exists. Log in instead.")
+        first = conn.execute("SELECT COUNT(*) FROM users WHERE password_hash IS NOT NULL").fetchone()[0] == 0
+        role = "admin" if first else "user"
+        contact = conn.execute("SELECT user_id FROM users WHERE LOWER(TRIM(email)) = ?", (clean_email,)).fetchone()
+        if contact:
+            uid = contact["user_id"]
+            conn.execute("UPDATE users SET password_hash = ?, role = ?, is_active = 1, owner_id = NULL WHERE user_id = ?",
+                         (password_hash, role, uid))
+        else:
+            cur = conn.execute("INSERT INTO users (name, email, password_hash, role, is_active) VALUES (?, ?, ?, ?, 1)",
+                               (str(name).strip(), clean_email, password_hash, role))
+            uid = cur.lastrowid
+        if first:
+            conn.execute("UPDATE users SET owner_id = ? WHERE password_hash IS NULL AND owner_id IS NULL", (uid,))
+            conn.execute("UPDATE groups SET owner_id = ? WHERE owner_id IS NULL", (uid,))
+        conn.commit()
+        return uid, role
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def set_password_hash(user_id, password_hash):
+    conn = get_db_connection()
+    conn.execute("UPDATE users SET password_hash = ? WHERE user_id = ?", (password_hash, user_id))
+    conn.commit(); conn.close()
+
+
+def set_account_role(user_id, role):
+    if role not in ("admin", "user"):
+        raise ValueError("Unknown role")
+    conn = get_db_connection()
+    conn.execute("UPDATE users SET role = ? WHERE user_id = ? AND password_hash IS NOT NULL", (role, user_id))
+    conn.commit(); conn.close()
+
+
+def set_account_active(user_id, active):
+    conn = get_db_connection()
+    conn.execute("UPDATE users SET is_active = ? WHERE user_id = ?", (1 if active else 0, user_id))
+    if not active:
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    conn.commit(); conn.close()
+
+
+def touch_last_login(user_id):
+    conn = get_db_connection()
+    conn.execute("UPDATE users SET last_login = ? WHERE user_id = ?",
+                 (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user_id))
+    conn.commit(); conn.close()
+
+
+def delete_account(user_id, new_owner_id):
+    """Delete an account and its own data; its contacts and circles move to new_owner_id."""
+    conn = get_db_connection()
+    conn.execute("UPDATE users SET owner_id = ? WHERE owner_id = ?", (new_owner_id, user_id))
+    conn.execute("UPDATE groups SET owner_id = ? WHERE owner_id = ?", (new_owner_id, user_id))
+    conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    conn.commit(); conn.close()
+
+
+def create_session(token_hash, user_id, days=30):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM sessions WHERE expires_at < ?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.execute("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                 (token_hash, user_id, (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit(); conn.close()
+
+
+def get_session_user(token_hash):
+    """The active account behind an unexpired session token, or None."""
+    conn = get_db_connection()
+    row = conn.execute("""
+        SELECT u.* FROM sessions s JOIN users u ON u.user_id = s.user_id
+        WHERE s.token_hash = ? AND s.expires_at > ? AND u.password_hash IS NOT NULL AND u.is_active = 1
+    """, (token_hash, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_session(token_hash):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+    conn.commit(); conn.close()
+
+
+def get_visible_groups(account):
+    """Admins see every circle; everyone else sees circles they made or belong to."""
+    if account["role"] == "admin":
+        return get_all_groups()
+    conn = get_db_connection()
+    rows = conn.execute("""
+        SELECT * FROM groups WHERE owner_id = ?
+           OR group_id IN (SELECT group_id FROM group_members WHERE user_id = ?)
+        ORDER BY group_name
+    """, (account["user_id"], account["user_id"])).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_managed_profiles(account):
+    """People whose personal budget this account may open: admins, everyone; others,
+    themselves plus the contacts they added."""
+    conn = get_db_connection()
+    if account["role"] == "admin":
+        rows = conn.execute("SELECT * FROM users ORDER BY name").fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT * FROM users WHERE user_id = ? OR (owner_id = ? AND password_hash IS NULL)
+            ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, name
+        """, (account["user_id"],) * 3).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_visible_people(account, group_ids):
+    """Everyone this account can see by name: its own profiles plus members of its circles."""
+    if account["role"] == "admin":
+        return get_all_users()
+    people = {u["user_id"]: u for u in get_managed_profiles(account)}
+    if group_ids:
+        conn = get_db_connection()
+        ph = ",".join("?" * len(group_ids))
+        for r in conn.execute(f"SELECT DISTINCT u.* FROM users u JOIN group_members gm ON gm.user_id = u.user_id "
+                              f"WHERE gm.group_id IN ({ph})", list(group_ids)).fetchall():
+            people.setdefault(r["user_id"], dict(r))
+        conn.close()
+    return sorted(people.values(), key=lambda u: u["name"].lower())
+
+
+def circle_name_taken(owner_id, group_name, exclude_group_id=None):
+    conn = get_db_connection()
+    row = conn.execute("SELECT 1 FROM groups WHERE owner_id IS ? AND LOWER(group_name) = LOWER(?) AND group_id IS NOT ?",
+                       (owner_id, str(group_name).strip(), exclude_group_id)).fetchone()
+    conn.close()
+    return bool(row)
+
 
 # --- Expenses CRUD ---
 def add_expense(user_id, amount, category, date=None, description="", payment_method="Card", notes=""):
@@ -508,18 +753,18 @@ def get_distinct_categories(user_id=None):
     return [r["category"] for r in rows if r["category"]]
 
 # --- Groups CRUD ---
-def create_group(group_name):
+def create_group(group_name, owner_id=None):
     group_name = str(group_name or "").strip()
     if not group_name:
         raise ValueError("Circle name is required.")
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        cur.execute("INSERT INTO groups (group_name) VALUES (?)", (group_name,))
+        cur.execute("INSERT INTO groups (group_name, owner_id) VALUES (?, ?)", (group_name, owner_id))
         conn.commit()
         gid = cur.lastrowid
     except sqlite3.IntegrityError:
-        raise ValueError(f"A circle named '{group_name}' already exists.")
+        raise ValueError(f"You already have a circle named '{group_name}'.")
     finally:
         conn.close()
     return gid
@@ -533,7 +778,7 @@ def rename_group(group_id, group_name):
         conn.execute("UPDATE groups SET group_name = ? WHERE group_id = ?", (group_name, group_id))
         conn.commit()
     except sqlite3.IntegrityError:
-        raise ValueError(f"A circle named '{group_name}' already exists.")
+        raise ValueError(f"There's already a circle named '{group_name}'.")
     finally:
         conn.close()
 
@@ -706,7 +951,11 @@ def delete_settlement(settlement_id):
     conn.commit()
     conn.close()
 
-def get_settlements(group_id=None):
+def get_settlements(group_id=None, group_ids=None):
+    """Payments in one circle, in the circles listed in group_ids, or (both None) everywhere."""
+    if group_id is None and group_ids is not None:
+        wanted = set(group_ids)
+        return [r for r in get_settlements() if r["group_id"] in wanted]
     conn = get_db_connection()
     if group_id:
         rows = conn.execute("""
@@ -878,6 +1127,19 @@ def reset_database():
     conn.close()
     init_db()
 
+def reset_data():
+    """Erase all budget data but keep every account (logins, roles) and app settings.
+    Accounts start over with no transactions, budgets, contacts or circles."""
+    conn = get_db_connection()
+    for t in ["reminder_log", "splits", "shared_expenses", "settlements", "group_members", "groups",
+              "category_budgets", "incomes", "expenses"]:
+        conn.execute(f"DELETE FROM {t}")
+    conn.execute("DELETE FROM users WHERE password_hash IS NULL")
+    conn.execute("UPDATE users SET monthly_budget = 0")
+    conn.commit()
+    conn.close()
+
+
 # --- Demo Data Generator ---
 def _month_start(d, months_back):
     """First day of the month `months_back` months before d (negative = months ahead)."""
@@ -887,26 +1149,44 @@ def _month_start(d, months_back):
 month_start = _month_start
 
 
-def seed_comprehensive_demo_data(reset=False):
-    """Populate a realistic six-month dataset for demos and testing. Amounts are in INR."""
-    if reset:
+def seed_comprehensive_demo_data(reset=False, as_user_id=None):
+    """Populate a realistic six-month dataset for demos and testing. Amounts are in INR.
+
+    With as_user_id (an account), that account plays the main character (the richest
+    history) and owns the sample contacts and circles; other accounts are kept, empty."""
+    if as_user_id:
+        init_db()
+        reset_data()
+    elif reset:
         reset_database()
     else:
         init_db()
 
     conn = get_db_connection()
-    user_count = conn.execute("SELECT count(*) FROM users").fetchone()[0]
+    user_count = conn.execute("SELECT count(*) FROM users WHERE password_hash IS NULL").fetchone()[0]
     conn.close()
-    if user_count > 0 and not reset:
+    if user_count > 0 and not reset and not as_user_id:
         return False  # Already seeded
 
     rng = random.Random(42)
     today = date.today()
 
-    u_alice = create_user("Alice Johnson", "alice@example.com", "9876543210", 60000.0)
-    u_bob = create_user("Bob Martinez", "bob@example.com", "9876543211", 45000.0)
-    u_charlie = create_user("Charlie Chen", "charlie@example.com", "9876543212", 40000.0)
-    u_diana = create_user("Diana Prince", "diana@example.com", "9876543213", 50000.0)
+    if as_user_id:
+        u_alice = as_user_id
+        update_user(u_alice, monthly_budget=60000.0)
+    else:
+        u_alice = create_user("Alice Johnson", "alice@example.com", "9876543210", 60000.0)
+    owner = as_user_id
+
+    def contact(name, email, phone, budget):
+        try:
+            return create_user(name, email, phone, budget, owner_id=owner)
+        except ValueError:  # an account already uses the sample email or number
+            return create_user(name, None, None, budget, owner_id=owner)
+
+    u_bob = contact("Bob Martinez", "bob@example.com", "9876543211", 45000.0)
+    u_charlie = contact("Charlie Chen", "charlie@example.com", "9876543212", 40000.0)
+    u_diana = contact("Diana Prince", "diana@example.com", "9876543213", 50000.0)
 
     for cat, limit in [
         ("Housing & Rent", 22000), ("Groceries", 8000), ("Food & Dining", 6000),
@@ -958,8 +1238,8 @@ def seed_comprehensive_demo_data(reset=False):
                     add_expense(uid, float(rng.randint(lo, hi)), cat, day(d), desc, method)
 
     # Circles
-    g_apt = create_group("Apartment 4B")
-    g_trip = create_group("Goa Weekend Trip")
+    g_apt = create_group("Apartment 4B", owner_id=owner)
+    g_trip = create_group("Goa Weekend Trip", owner_id=owner)
     for uid in [u_alice, u_bob, u_charlie]:
         add_member_to_group(g_apt, uid)
     for uid in [u_alice, u_bob, u_charlie, u_diana]:

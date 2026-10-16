@@ -13,10 +13,11 @@ from database import get_db_connection
 # Categories paid once a month; excluded when extrapolating month-end spending.
 FIXED_MONTHLY_CATEGORIES = ("Housing & Rent",)
 
-def compute_balances(group_id=None):
+def compute_balances(group_id=None, group_ids=None):
     """
     Returns dict {user_id: net_balance} where positive = owed money (+), negative = owes money (-).
     Sum of net balances across a group always nets out to zero.
+    With group_id=None, `group_ids` limits the total to those circles (None = every circle).
     """
     conn = get_db_connection()
     balances = defaultdict(float)
@@ -49,10 +50,14 @@ def compute_balances(group_id=None):
             if m["user_id"] not in balances:
                 balances[m["user_id"]] = 0.0
     else:
+        where, params = "", []
+        if group_ids is not None:
+            where = f" WHERE se.group_id IN ({','.join('?' * len(group_ids))})"
+            params = list(group_ids)
         rows = conn.execute("""
             SELECT s.user_id as debtor, s.amount_owed, s.is_paid, se.payer_id
             FROM splits s JOIN shared_expenses se ON s.shared_id = se.shared_id
-        """).fetchall()
+        """ + where, params).fetchall()
         for r in rows:
             if r["debtor"] == r["payer_id"]:
                 continue
@@ -60,7 +65,8 @@ def compute_balances(group_id=None):
                 balances[r["debtor"]] -= r["amount_owed"]
                 balances[r["payer_id"]] += r["amount_owed"]
 
-        rows2 = conn.execute("SELECT from_user, to_user, amount FROM settlements").fetchall()
+        rows2 = conn.execute("SELECT from_user, to_user, amount FROM settlements"
+                             + where.replace("se.group_id", "group_id"), params).fetchall()
         for r in rows2:
             balances[r["from_user"]] += r["amount"]
             balances[r["to_user"]] -= r["amount"]
@@ -68,9 +74,9 @@ def compute_balances(group_id=None):
     conn.close()
     return {uid: round(bal, 2) for uid, bal in balances.items()}
 
-def compute_balances_detailed(group_id=None):
+def compute_balances_detailed(group_id=None, group_ids=None):
     """Returns list of {user_id, name, balance, status} sorted descending — single batched user lookup."""
-    balances = compute_balances(group_id)
+    balances = compute_balances(group_id, group_ids)
     if not balances:
         return []
     conn = get_db_connection()
@@ -393,15 +399,17 @@ def get_sankey_debt_data(group_id=None, curr="₹"):
         "labels": labels
     }
 
-def get_settlement_plan(group_id=None):
+def get_settlement_plan(group_id=None, group_ids=None):
     """
     Settlement transfers, always computed per circle so every recorded payment can be
-    attached to the circle it clears. With group_id=None every circle is included.
-    Each transfer dict carries group_id / group_name.
+    attached to the circle it clears. With group_id=None every circle in `group_ids` is
+    included (None = every circle). Each transfer dict carries group_id / group_name.
     """
     conn = get_db_connection()
     if group_id is None:
         groups = conn.execute("SELECT group_id, group_name FROM groups ORDER BY group_name").fetchall()
+        if group_ids is not None:
+            groups = [g for g in groups if g["group_id"] in set(group_ids)]
     else:
         groups = conn.execute("SELECT group_id, group_name FROM groups WHERE group_id = ?", (group_id,)).fetchall()
     conn.close()
@@ -517,7 +525,7 @@ def validate_user_data(name, email, phone, exclude_user_id=None):
     # Check Email Uniqueness in Database
     existing_user_email = db.get_user_by_email(clean_email)
     if existing_user_email and (exclude_user_id is None or existing_user_email["user_id"] != exclude_user_id):
-        return False, f"Email '{clean_email}' is already registered to '{existing_user_email['name']}'.", None, None
+        return False, f"Email '{clean_email}' is already in use.", None, None
 
     # Mobile number is optional; when given it must be 10 digits (spaces/dashes allowed)
     phone_str = str(phone).strip() if phone else ""
@@ -531,7 +539,7 @@ def validate_user_data(name, email, phone, exclude_user_id=None):
 
         existing_user_phone = db.get_user_by_phone(clean_phone)
         if existing_user_phone and (exclude_user_id is None or existing_user_phone["user_id"] != exclude_user_id):
-            return False, f"Mobile number '{clean_phone}' is already registered to '{existing_user_phone['name']}'.", None, None
+            return False, f"Mobile number '{clean_phone}' is already in use.", None, None
 
     return True, None, clean_email, clean_phone
 
