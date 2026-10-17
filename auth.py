@@ -235,15 +235,16 @@ def log_in(email, password):
     return account, None
 
 
-def change_password(user_id, current, new, confirm):
-    """Returns an error message, or None when the password was changed."""
+def change_password(user_id, current, new, confirm, keep_token=None):
+    """Returns an error message, or None when the password was changed. Other logins of the
+    account are signed out; keep_token (this browser's session) stays logged in."""
     account = db.get_user(user_id)
     if not account or not verify_password(current or "", account["password_hash"]):
         return "Your current password isn't right."
     err = password_problem(new, confirm)
     if err:
         return err
-    db.set_password_hash(user_id, hash_password(new))
+    db.set_password_hash(user_id, hash_password(new), keep_session=_token_hash(keep_token) if keep_token else None)
     return None
 
 

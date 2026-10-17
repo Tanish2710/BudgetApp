@@ -54,8 +54,16 @@ SMTP_KEYS = ["smtp_host", "smtp_port", "smtp_user", "smtp_pass", "from_email", "
 # ---------------------------------------------------------------------------
 # Settings & credentials
 # ---------------------------------------------------------------------------
+_db_ready = False
+
+
 def get_settings():
-    db.init_db()
+    # The schema only needs creating once per process; init_db() writes to the database,
+    # and this runs on every page load.
+    global _db_ready
+    if not _db_ready:
+        db.init_db()
+        _db_ready = True
     return db.get_settings(DEFAULT_SETTINGS)
 
 

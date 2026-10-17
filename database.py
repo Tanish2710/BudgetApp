@@ -509,9 +509,12 @@ def delete_pending_verification(email):
     conn.commit(); conn.close()
 
 
-def set_password_hash(user_id, password_hash):
+def set_password_hash(user_id, password_hash, keep_session=None):
+    """Set a new password and sign the account out everywhere (except the session whose
+    token hash is keep_session), so an old or stolen login stops working."""
     conn = get_db_connection()
     conn.execute("UPDATE users SET password_hash = ? WHERE user_id = ?", (password_hash, user_id))
+    conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash IS NOT ?", (user_id, keep_session))
     conn.commit(); conn.close()
 
 
@@ -539,12 +542,28 @@ def touch_last_login(user_id):
 
 
 def delete_account(user_id, new_owner_id):
-    """Delete an account and its own data; its contacts and circles move to new_owner_id."""
+    """Delete an account and its own data; its contacts and circles move to new_owner_id.
+    A moved circle whose name the new owner already uses gets "(from <name>)" added, since
+    circle names are unique per owner."""
     conn = get_db_connection()
-    conn.execute("UPDATE users SET owner_id = ? WHERE owner_id = ?", (new_owner_id, user_id))
-    conn.execute("UPDATE groups SET owner_id = ? WHERE owner_id = ?", (new_owner_id, user_id))
-    conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-    conn.commit(); conn.close()
+    try:
+        name = (conn.execute("SELECT name FROM users WHERE user_id = ?", (user_id,)).fetchone() or {"name": "deleted account"})["name"]
+        conn.execute("UPDATE users SET owner_id = ? WHERE owner_id = ?", (new_owner_id, user_id))
+        for g in conn.execute("SELECT group_id, group_name FROM groups WHERE owner_id = ?", (user_id,)).fetchall():
+            new_name, n = g["group_name"], 1
+            while conn.execute("SELECT 1 FROM groups WHERE owner_id IS ? AND LOWER(group_name) = LOWER(?)",
+                               (new_owner_id, new_name)).fetchone():
+                n += 1
+                new_name = f"{g['group_name']} (from {name})" + (f" {n - 1}" if n > 2 else "")
+            conn.execute("UPDATE groups SET owner_id = ?, group_name = ? WHERE group_id = ?",
+                         (new_owner_id, new_name, g["group_id"]))
+        conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def create_session(token_hash, user_id, days=30):
@@ -832,6 +851,9 @@ def rename_group(group_id, group_name):
     group_name = str(group_name or "").strip()
     if not group_name:
         raise ValueError("Circle name is required.")
+    group = get_group(group_id)
+    if group and circle_name_taken(group["owner_id"], group_name, exclude_group_id=group_id):
+        raise ValueError(f"There's already a circle named '{group_name}'.")
     conn = get_db_connection()
     try:
         conn.execute("UPDATE groups SET group_name = ? WHERE group_id = ?", (group_name, group_id))
