@@ -19,7 +19,9 @@ Personal budgeting and shared expenses in one Streamlit app: track spending agai
 
 ## Accounts and roles
 
-Everyone logs in with an email and password. Accounts are created from the **Create account** tab on the login screen.
+Everyone logs in with an email and password. Accounts are created from the **Create account** tab on the login screen, and only exist once the person enters the 6-digit code emailed to that address, so nobody can sign up with an email they don't control. Changing your login email in Settings works the same way. Codes expire after 15 minutes and stop working after 5 wrong tries.
+
+Verification emails go out through the same SMTP server as reminders (see [Email (SMTP)](#email-smtp)). Until one is configured nobody can sign up, so set the `SMTP_*` environment variables before creating the first account.
 
 - **The first account becomes the admin.** Anything already in the database (people, circles, transactions) is assigned to that admin, so nothing is lost when upgrading. Every later account is a regular user.
 - **Users** see and edit only their own budget, the people they've added to split bills with, and the circles they created or belong to. To split with someone who has their own account, add them to a circle by their account email. If you add a person and they later sign up with the same email, they take over that profile, including the bills already recorded for them.
