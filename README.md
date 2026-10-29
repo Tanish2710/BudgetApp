@@ -23,6 +23,21 @@ Everyone logs in with an email and password. Accounts are created from the **Cre
 
 Verification emails go out through the same SMTP server as reminders (see [Email (SMTP)](#email-smtp)). Until one is configured nobody can sign up, so set the `SMTP_*` environment variables before creating the first account.
 
+### Getting admin access
+
+There is no built-in admin username or password. Create one yourself in any of these ways:
+
+- **Sign up first.** On a fresh database the first account to sign up becomes the admin (needs email set up for the code).
+- **From the command line**, no email needed. Also the way back in if the admin forgets their password; an existing account with that email is made an admin and given the new password:
+
+  ```bash
+  python3 create_admin.py --email you@example.com --name "Your Name"   # asks for the password
+  ```
+
+- **On a host without a shell** (e.g. Streamlit Community Cloud), set `ADMIN_EMAIL` and `ADMIN_PASSWORD` (and optionally `ADMIN_NAME`) as secrets or environment variables. When the app starts and no account uses that email yet, it creates that admin. Change the password in Settings after your first login.
+
+To log out, use **Log out** at the bottom of the sidebar or in **Settings → Account**.
+
 - **The first account becomes the admin.** Anything already in the database (people, circles, transactions) is assigned to that admin, so nothing is lost when upgrading. Every later account is a regular user.
 - **Users** see and edit only their own budget, the people they've added to split bills with, and the circles they created or belong to. To split with someone who has their own account, add them to a circle by their account email. If you add a person and they later sign up with the same email, they take over that profile, including the bills already recorded for them.
 - **Admins** can do everything a user can, plus: the **Admin** page (every account, promote/demote, deactivate/reactivate, set a new password, delete an account, open new sign-ups or close them), the **Reminders** page (the app-wide email server and schedule), the app currency, and resetting or loading sample data. The *Viewing as* box in the sidebar lets an admin open anyone's budget.

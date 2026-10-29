@@ -248,6 +248,30 @@ def change_password(user_id, current, new, confirm, keep_token=None):
     return None
 
 
+def set_up_admin(name, email, password):
+    """Make sure an admin account with this email and password exists, without an emailed code.
+    For whoever runs the app (create_admin.py or the ADMIN_* environment variables), so the
+    first admin can get in before email is set up, or an admin who forgot the password can get
+    back in. An existing account with this email is promoted to admin, reactivated and given
+    the new password (signing it out elsewhere). Returns (account, error)."""
+    email, err = clean_email(email)
+    if err:
+        return None, err
+    err = password_problem(password)
+    if err:
+        return None, err
+    account = db.get_account_by_email(email)
+    if account:
+        db.set_password_hash(account["user_id"], hash_password(password))
+        uid = account["user_id"]
+    else:
+        uid, _ = db.create_account(str(name or "").strip() or email.split("@")[0].title(), email, hash_password(password))
+    db.set_account_role(uid, "admin")
+    db.set_account_active(uid, True)
+    db.delete_pending_verification(email)
+    return db.get_user(uid), None
+
+
 def _token_hash(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 

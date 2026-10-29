@@ -93,3 +93,19 @@ def test_password_rules_and_login(app):
     db.create_account("Pat", "pat@x.com", auth.hash_password("abc12345"))
     assert auth.log_in("PAT@x.com ", "abc12345")[1] is None
     assert auth.log_in("pat@x.com", "wrong1234")[0] is None
+
+
+def test_set_up_admin_creates_or_recovers_an_admin_without_email(app):
+    db, _, auth = app
+    assert auth.set_up_admin("Boss", "boss@x.com", "short")[1]
+    admin, err = auth.set_up_admin("Boss", "boss@x.com", "firstpass1")
+    assert err is None and admin["role"] == "admin"
+    assert auth.log_in("boss@x.com", "firstpass1")[0]
+    # A second account, demoted and deactivated, can be turned back into a working admin.
+    uid, role = db.create_account("Ann", "ann@x.com", auth.hash_password("annpass12"))
+    assert role == "user"
+    db.set_account_active(uid, False)
+    ann, err = auth.set_up_admin("", "ann@x.com", "newpass123")
+    assert err is None and ann["role"] == "admin" and ann["is_active"]
+    assert auth.log_in("ann@x.com", "annpass12")[0] is None
+    assert auth.log_in("ann@x.com", "newpass123")[0]["user_id"] == uid

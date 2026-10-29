@@ -34,6 +34,13 @@ st.set_page_config(
 def _bootstrap():
     """Runs once per server process: create/migrate the schema and start the reminder scheduler."""
     db.init_db()
+    # ADMIN_EMAIL + ADMIN_PASSWORD (e.g. hosting secrets) create that admin on first start,
+    # so a fresh deploy can be logged into before email verification is set up.
+    admin_email, admin_pw = os.environ.get("ADMIN_EMAIL"), os.environ.get("ADMIN_PASSWORD")
+    if admin_email and admin_pw and not db.get_account_by_email(admin_email):
+        _, err = auth.set_up_admin(os.environ.get("ADMIN_NAME", ""), admin_email, admin_pw)
+        if err:
+            print(f"ADMIN_EMAIL/ADMIN_PASSWORD not used: {err}", file=sys.stderr)
     reminders.start_background_scheduler()
     return True
 
@@ -1695,6 +1702,11 @@ def page_settings():
                         else:
                             flash("Password changed", ":material/key:")
                             st.rerun()
+            with st.container(border=True):
+                section("Log out", "Sign out of Smart Budgeter on this browser. The button at the bottom of the sidebar does the same.")
+                if st.button("Log out", icon=":material/logout:", key="logout_settings"):
+                    _log_out()
+                    st.rerun()
 
     with t_people:
         # People without an account ("contacts") exist to split bills with. Regular users
